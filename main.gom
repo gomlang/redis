@@ -58,7 +58,7 @@ pub fn exercise() -> () {
     testing::assert_eq(text(decoded), "中文");
 }
 
-fn live(address: string, version: string, password: string) -> () {
+pub fn live(address: string, version: string, password: string) -> () {
     let address = testing::expect_ok(net::SocketAddr::parse(address), "address");
     let options = ConnectionOptions {
         protocol: if version == "2" {
@@ -75,6 +75,7 @@ fn live(address: string, version: string, password: string) -> () {
         client_name: Option::Some("goml-ecosystem"),
         ..ConnectionOptions::standard(),
     };
+    pool_live(address, options);
     let connect = || testing::expect_ok(
         Connection::connect(address, options, Operation::new()),
         "real Redis connect",
@@ -491,6 +492,9 @@ fn run() -> Result[(), string] {
         }
         live(args[2], args[3], args[4]);
         return Result::Ok(())
+    }
+    if args[1] == "--tls" {
+        return secure_network(args)
     }
     let input = io::read_stdin_to_string().map_err(|e| e.to_string())?;
     let requests = json::as_array(json::parse(input)?).ok_or("expected array")?;
