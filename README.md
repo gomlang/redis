@@ -319,7 +319,7 @@ on the selected server version; unsupported commands return normal server errors
 ## Validation
 
 ```sh
-just ecosystem-test redis
+(cd ../verification && just ecosystem-test redis)
 ```
 
 All verification is driven by GoML tests. Library tests cover RESP2/RESP3 codecs,
@@ -329,7 +329,7 @@ The specification generator constructs binary scalars, streamed arrays/maps,
 attributes and blob chunks independently of the codec and compares canonical wire bytes.
 
 Consumer tests download the official Redis 7.2.5 tag archive with pinned SHA-256,
-build it under `../../goml-dev/ecosystem/_artifact/reference`, and run both RESP protocols against
+build it under `../verification/_artifact/reference`, and run both RESP protocols against
 a fresh authenticated loopback server with persistence disabled. `std::process`
 and scoped cancellation own the server lifetime; startup and subprocess commands
 have deadlines. This requires curl, tar, make, a C compiler and network access on
