@@ -12,10 +12,14 @@ impl Connection {
         if let Err(problem) = accepted {
             return Result::Err(self.fatal(problem, false, Vec::new()))
         }
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.close();
+            }
+        };
         let result = self.transaction_queued(pipeline, commands, deadline);
-        if result.is_err() && !self.is_closed() {
-            let _ = self.close();
-        }
+        completed.set(result.is_ok());
         result
     }
 
@@ -97,6 +101,12 @@ impl Connection {
         defer self.gate.send(());
         self.ordinary()?;
         let _: () = FromReply::from_reply(self.one(watch, deadline)?)?;
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.close();
+            }
+        };
         let result = self.watched_plan(reads, build, deadline);
         if !self.is_closed() {
             match self.one(single("UNWATCH", Vec::new()), deadline) {
@@ -112,6 +122,7 @@ impl Connection {
                 },
             }
         }
+        completed.set(true);
         result
     }
 
