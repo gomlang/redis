@@ -7,17 +7,25 @@ impl Connection {
     ] {
         let commands = pipeline.commands.copy();
         let _ = self.wire(commands, true)?;
-        let start = self.one(single("MULTI", Vec::new()), deadline)?.checked()?;
-        let accepted: Result[(), Error] = FromReply::from_reply(start);
-        if let Err(problem) = accepted {
-            return Result::Err(self.fatal(problem, false, Vec::new()))
-        }
         let completed = Ref::new(false);
         defer {
             if !completed.get() {
                 let _ = self.close();
             }
         };
+        let start = match self.one(single("MULTI", Vec::new()), deadline).and_then(
+            |value| value.checked(),
+        ) {
+            Ok(value) => value,
+            Err(problem) => {
+                completed.set(true);
+                return Result::Err(problem)
+            },
+        };
+        let accepted: Result[(), Error] = FromReply::from_reply(start);
+        if let Err(problem) = accepted {
+            return Result::Err(self.fatal(problem, false, Vec::new()))
+        }
         let result = self.transaction_queued(pipeline, commands, deadline);
         completed.set(result.is_ok());
         result
@@ -100,13 +108,20 @@ impl Connection {
         deadline.acquire(self.gate, self.closed)?;
         defer self.gate.send(());
         self.ordinary()?;
-        let _: () = FromReply::from_reply(self.one(watch, deadline)?)?;
         let completed = Ref::new(false);
         defer {
             if !completed.get() {
                 let _ = self.close();
             }
         };
+        let start = match self.one(watch, deadline).and_then(|value| value.checked()) {
+            Ok(value) => value,
+            Err(problem) => {
+                completed.set(true);
+                return Result::Err(problem)
+            },
+        };
+        let _: () = FromReply::from_reply(start)?;
         let result = self.watched_plan(reads, build, deadline);
         if !self.is_closed() {
             match self.one(single("UNWATCH", Vec::new()), deadline) {

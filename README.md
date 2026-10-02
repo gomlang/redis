@@ -229,8 +229,9 @@ MULTI/EXEC under one connection gate. It clears watch state on application
 errors and on completion; failed cleanup closes the socket. The callback must
 not reenter this connection, wait on a task using it, or perform unbounded work.
 A callback panic propagates after closing the connection, preventing retained WATCH
-state from reaching a later operation or pool lease. Panic unwinding after MULTI
-also closes the connection. Ordinary callback errors still attempt UNWATCH and
+state from reaching a later operation or pool lease. Panic unwinding during
+WATCH/MULTI setup or an active transaction also closes the connection. A complete
+server rejection of setup keeps the connection reusable. Ordinary callback errors still attempt UNWATCH and
 keep a synchronized connection reusable. Use another connection when an
 independent operation is required. Callers own conflict retry policy. The callback is ordinary synchronous code and cannot be
 preempted by the operation timeout.
