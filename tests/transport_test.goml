@@ -6,6 +6,7 @@ use std::io;
 use std::task;
 use std::time;
 use std::testing;
+use std::panic;
 
 struct Scripted {
     source: Vec[u8],
@@ -13,6 +14,7 @@ struct Scripted {
     writes: Vec[Vec[u8]],
     closes: Ref[isize],
     bad_read: Ref[bool],
+    panic_exec: Ref[bool],
 }
 
 impl Scripted {
@@ -23,6 +25,7 @@ impl Scripted {
             writes: Vec::new(),
             closes: Ref::new(0),
             bad_read: Ref::new(false),
+            panic_exec: Ref::new(false),
         }
     }
 
@@ -44,6 +47,10 @@ impl Scripted {
             |buffer, operation| {
                 testing::assert_some(operation.timeout());
                 self.writes.push(buffer.to_vec());
+                let (_, command) = string_from_utf8(buffer.to_vec());
+                if self.panic_exec.get() && command.contains("EXEC") {
+                    panic::raise("EXEC transport panic");
+                }
                 Result::Ok(())
             },
             || {
@@ -176,4 +183,152 @@ fn dialer_shares_setup_deadline_and_precancel_does_not_dial() -> () {
         "dial failure",
     );
     testing::assert(problem.io_kind == Option::Some(io::ErrorKind::PermissionDenied));
+}
+
+#[test]
+fn watched_callback_panics_close_before_releasing_connection_state() -> () {
+    let script = Scripted::new("%1\r\n+proto\r\n:3\r\n+OK\r\n");
+    let connection = testing::expect_ok(
+        redis::Connection::from_transport(
+            script.transport(),
+            redis::ConnectionOptions::standard(),
+            redis::Operation::new(),
+        ),
+        "connection",
+    );
+    let unwound = Ref::new(false);
+    let caught = panic::catch(
+        || connection.compare_and_set(
+            Vec::from_array([redis::Blob::from_string("key")]),
+            redis::Pipeline::new(),
+            |_| {
+                defer unwound.set(true);
+                panic::raise("WATCH callback panic")
+            },
+            redis::Operation::new(),
+        ),
+    );
+    testing::assert(caught.is_err());
+    testing::assert(unwound.get());
+    testing::assert(connection.is_closed());
+    testing::assert_eq(script.closes.get(), 1);
+    let problem = testing::expect_err(
+        connection.execute(testing::expect_ok(commands::ping(), "ping"), redis::Operation::new()),
+        "closed after panic",
+    );
+    testing::assert_eq(problem.kind, redis::ErrorKind::Closed);
+    testing::assert(!problem.may_have_executed);
+    testing::assert_eq(script.writes.len(), 2);
+}
+
+#[test]
+fn watched_callback_errors_unwatch_and_leave_connection_reusable() -> () {
+    let script = Scripted::new("%1\r\n+proto\r\n:3\r\n+OK\r\n+OK\r\n+PONG\r\n");
+    let connection = testing::expect_ok(
+        redis::Connection::from_transport(
+            script.transport(),
+            redis::ConnectionOptions::standard(),
+            redis::Operation::new(),
+        ),
+        "connection",
+    );
+    let error = testing::expect_err(
+        connection.compare_and_set(
+            Vec::from_array([redis::Blob::from_string("key")]),
+            redis::Pipeline::new(),
+            |_| Result::Err(redis::Error::new(redis::ErrorKind::Type, "application rejected")),
+            redis::Operation::new(),
+        ),
+        "application error",
+    );
+    testing::assert_eq(error.message, "application rejected");
+    testing::assert(!connection.is_closed());
+    testing::assert_eq(
+        testing::expect_ok(
+            connection.execute(
+                testing::expect_ok(commands::ping(), "ping"),
+                redis::Operation::new(),
+            ),
+            "reused connection",
+        ),
+        "PONG",
+    );
+    let (_, unwatch) = string_from_utf8(script.writes[2]);
+    testing::assert(unwatch.contains("UNWATCH"));
+    testing::assert_ok(connection.close());
+}
+
+#[test]
+fn transaction_transport_panic_closes_active_multi_scope() -> () {
+    let script = Scripted::new("%1\r\n+proto\r\n:3\r\n+OK\r\n");
+    let connection = testing::expect_ok(
+        redis::Connection::from_transport(
+            script.transport(),
+            redis::ConnectionOptions::standard(),
+            redis::Operation::new(),
+        ),
+        "connection",
+    );
+    script.panic_exec.set(true);
+    let caught = panic::catch(
+        || connection.transaction(redis::Pipeline::new(), redis::Operation::new()),
+    );
+    testing::assert(caught.is_err());
+    testing::assert(connection.is_closed());
+    testing::assert_eq(script.closes.get(), 1);
+}
+
+#[test]
+fn pool_evicts_a_lease_after_a_watched_callback_panics() -> () {
+    let first = Scripted::new("%1\r\n+proto\r\n:3\r\n+OK\r\n");
+    let second = Scripted::new("%1\r\n+proto\r\n:3\r\n+PONG\r\n");
+    let calls = Ref::new(0);
+    let pool = testing::expect_ok(
+        redis::Pool::new(
+            redis::PoolOptions {
+                max_connections: 1,
+                max_idle: 1,
+                health_check: redis::HealthCheck::Never,
+                ..redis::PoolOptions::standard(),
+            },
+            |operation| {
+                calls.set(calls.get() + 1);
+                let script: Scripted = if calls.get() == 1 {
+                    first
+                } else {
+                    second
+                };
+                redis::Connection::from_transport(
+                    script.transport(),
+                    redis::ConnectionOptions::standard(),
+                    operation,
+                )
+            },
+        ),
+        "pool",
+    );
+    defer {
+        let _ = pool.close();
+    };
+    let lease = testing::expect_ok(pool.acquire(redis::Operation::new()), "lease");
+    let caught = panic::catch(
+        || lease.compare_and_set(
+            Vec::from_array([redis::Blob::from_string("key")]),
+            redis::Pipeline::new(),
+            |_| panic::raise("pooled WATCH panic"),
+            redis::Operation::new(),
+        ),
+    );
+    testing::assert(caught.is_err());
+    testing::assert_ok(lease.release());
+    testing::assert_eq(pool.stats().idle, 0);
+    testing::assert_eq(first.closes.get(), 1);
+    testing::assert_eq(
+        testing::expect_ok(
+            pool.execute(testing::expect_ok(commands::ping(), "ping"), redis::Operation::new()),
+            "replacement connection",
+        ),
+        "PONG",
+    );
+    testing::assert_eq(calls.get(), 2);
 }
