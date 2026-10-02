@@ -1,6 +1,6 @@
 package tests;
 
-use consumer::redis as app;
+use downstream::redis as app;
 use std::bytes;
 use std::env;
 use std::fs;

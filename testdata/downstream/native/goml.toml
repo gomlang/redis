@@ -1,5 +1,5 @@
 [module]
-path = "consumer::redis"
+path = "downstream::redis"
 
 [dependencies]
 "ecosystem::redis" = "0.1.0"

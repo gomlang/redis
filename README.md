@@ -328,7 +328,7 @@ pipelines, transactions, transport failures, cancellation and concurrent pools.
 The specification generator constructs binary scalars, streamed arrays/maps,
 attributes and blob chunks independently of the codec and compares canonical wire bytes.
 
-Consumer tests download the official Redis 7.2.5 tag archive with pinned SHA-256,
+Native downstream tests download the official Redis 7.2.5 tag archive with pinned SHA-256,
 build it under `../verification/_artifact/reference`, and run both RESP protocols against
 a fresh authenticated loopback server with persistence disabled. `std::process`
 and scoped cancellation own the server lifetime; startup and subprocess commands
@@ -337,7 +337,7 @@ the first run. Tests include command families, binary values, Lua, pipelines,
 transaction errors, WATCH cleanup, Pub/Sub, concurrent pooled increments, and
 health replacement after CLIENT KILL.
 
-Fifteen further consumer cases exercise DNS, verified TLS, mTLS, untrusted roots,
+Fifteen further downstream cases exercise DNS, verified TLS, mTLS, untrusted roots,
 wrong hostnames, handshake/HELLO/I/O deadlines, both cancellation APIs and pooled
 TLS reuse/eviction. A test-only Go TLS peer generates ephemeral certificates;
 GoML tests own scenarios and assertions and synchronize cancellation with request
@@ -347,3 +347,14 @@ runs native and generated tests with Go's race detector.
 Protocol references: [Redis RESP specification](https://redis.io/docs/latest/develop/reference/protocol-spec/),
 [RESP3 streamed types](https://github.com/antirez/RESP3/blob/master/spec.md),
 and [Redis transactions](https://redis.io/docs/latest/develop/using-commands/transactions/).
+
+## Development and downstream checks
+
+Requires GoML 0.1.55 or newer. The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+
+```sh
+goml test
+goml verify --timeout 300s
+```
+
+`goml verify` builds and tests the fixture against an isolated registry snapshot. `(cd ../verification && just ecosystem-test redis)` also runs the library-specific smoke and compatibility checks.

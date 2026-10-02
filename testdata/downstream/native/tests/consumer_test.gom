@@ -1,6 +1,6 @@
 package tests;
 
-use consumer::redis;
+use downstream::redis as redis;
 
 #[test]
 fn independent_public_api_and_custom_reply_trait() -> () {
