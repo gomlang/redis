@@ -15,6 +15,7 @@ struct Scripted {
     closes: Ref[isize],
     bad_read: Ref[bool],
     panic_exec: Ref[bool],
+    panic_reply: Ref[bool],
 }
 
 impl Scripted {
@@ -26,6 +27,7 @@ impl Scripted {
             closes: Ref::new(0),
             bad_read: Ref::new(false),
             panic_exec: Ref::new(false),
+            panic_reply: Ref::new(false),
         }
     }
 
@@ -33,6 +35,9 @@ impl Scripted {
         redis::Transport::new(
             |buffer, operation| {
                 testing::assert_some(operation.timeout());
+                if self.panic_reply.get() && self.writes.len() > 1 {
+                    panic::raise("stateful setup reply panic");
+                }
                 if self.bad_read.get() {
                     return Result::Ok(buffer.len() + 1)
                 }
@@ -331,4 +336,77 @@ fn pool_evicts_a_lease_after_a_watched_callback_panics() -> () {
         "PONG",
     );
     testing::assert_eq(calls.get(), 2);
+}
+
+#[test]
+fn stateful_setup_acknowledgement_panics_close_connections() -> () {
+    for watch in Vec::from_array([false, true]) {
+        let script = Scripted::new("%1\r\n+proto\r\n:3\r\n+OK\r\n");
+        let connection = testing::expect_ok(
+            redis::Connection::from_transport(
+                script.transport(),
+                redis::ConnectionOptions::standard(),
+                redis::Operation::new(),
+            ),
+            "connection",
+        );
+        script.panic_reply.set(true);
+        let caught = panic::catch(
+            || {
+                if watch {
+                    connection.compare_and_set(
+                        Vec::from_array([redis::Blob::from_string("key")]),
+                        redis::Pipeline::new(),
+                        |_| Result::Ok(redis::Pipeline::new()),
+                        redis::Operation::new(),
+                    )
+                } else {
+                    connection.transaction(redis::Pipeline::new(), redis::Operation::new())
+                }
+            },
+        );
+        testing::assert(caught.is_err());
+        testing::assert(connection.is_closed());
+        testing::assert_eq(script.closes.get(), 1);
+        testing::assert_eq(script.writes.len(), 2);
+    }
+}
+
+#[test]
+fn rejected_stateful_setup_keeps_connections_reusable() -> () {
+    for watch in Vec::from_array([false, true]) {
+        let script = Scripted::new("%1\r\n+proto\r\n:3\r\n-ERR setup rejected\r\n+PONG\r\n");
+        let connection = testing::expect_ok(
+            redis::Connection::from_transport(
+                script.transport(),
+                redis::ConnectionOptions::standard(),
+                redis::Operation::new(),
+            ),
+            "connection",
+        );
+        let result = if watch {
+            connection.compare_and_set(
+                Vec::from_array([redis::Blob::from_string("key")]),
+                redis::Pipeline::new(),
+                |_| Result::Ok(redis::Pipeline::new()),
+                redis::Operation::new(),
+            )
+        } else {
+            connection.transaction(redis::Pipeline::new(), redis::Operation::new())
+        };
+        let problem = testing::expect_err(result, "setup rejected");
+        testing::assert_eq(problem.kind, redis::ErrorKind::Server);
+        testing::assert(!connection.is_closed());
+        testing::assert_eq(
+            testing::expect_ok(
+                connection.execute(
+                    testing::expect_ok(commands::ping(), "ping"),
+                    redis::Operation::new(),
+                ),
+                "connection remains synchronized",
+            ),
+            "PONG",
+        );
+        testing::assert_ok(connection.close());
+    }
 }
