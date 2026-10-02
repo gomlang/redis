@@ -137,3 +137,66 @@ fn published_pool_restores_reservation_after_connector_unwind() -> () {
     testing::assert_eq(calls.get(), 2);
     testing::assert_eq(pool.stats().opening, 0);
 }
+
+#[test]
+fn published_lease_release_panic_reclaims_capacity_and_closes_transport() -> () {
+    let inspect_panics = Ref::new(false);
+    let closes = Ref::new(0);
+    let pool = testing::expect_ok(
+        client::Pool::new(
+            client::PoolOptions {
+                max_connections: 1,
+                max_idle: 1,
+                ..client::PoolOptions::standard(),
+            },
+            |operation| {
+                let bytes = "%1\r\n+proto\r\n:3\r\n+PONG\r\n".to_bytes();
+                let offset = Ref::new(0);
+                client::Connection::from_transport(
+                    client::Transport::new(
+                        |buffer, _| {
+                            let mut count = 0;
+                            while count < buffer.len() && offset.get() < bytes.len() {
+                                buffer[count] = bytes[offset.get()];
+                                offset.set(offset.get() + 1);
+                                count += 1;
+                            }
+                            Result::Ok(count)
+                        },
+                        |_, _| Result::Ok(()),
+                        || {
+                            closes.set(closes.get() + 1);
+                            Result::Ok(())
+                        },
+                        || {
+                            if inspect_panics.get() {
+                                panic::raise("consumer release panic");
+                            }
+                            false
+                        },
+                    ),
+                    client::ConnectionOptions::standard(),
+                    operation,
+                )
+            },
+        ),
+        "pool",
+    );
+    defer {
+        let _ = pool.close();
+    };
+    let lease = testing::expect_ok(pool.acquire(client::Operation::new()), "lease");
+    inspect_panics.set(true);
+    testing::assert(panic::catch(|| lease.release()).is_err());
+    testing::assert_eq(closes.get(), 1);
+    testing::assert_eq(pool.stats().leased, 0);
+    testing::assert_ok(lease.release());
+    inspect_panics.set(false);
+    testing::assert_eq(
+        testing::expect_ok(
+            pool.execute(testing::expect_ok(commands::ping(), "ping"), client::Operation::new()),
+            "replacement",
+        ),
+        "PONG",
+    );
+}

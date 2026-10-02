@@ -1,0 +1,160 @@
+package redis;
+
+use std::io;
+use std::panic;
+use std::task;
+use std::testing;
+
+fn cleanup_wait_signal(pool: Pool) -> Channel[()] {
+    let deadline = Deadline::new(Operation::new());
+    defer deadline.stop();
+    match testing::expect_ok(pool.choose(deadline), "reserved slot chooses wait") {
+        PoolChoice::Wait(changed) => changed,
+        _ => panic::raise("pool capacity was not reserved"),
+    }
+}
+
+fn cleanup_was_notified(signal: Channel[()]) -> bool {
+    select {
+        recv(signal) as value => value.is_none(),
+        default => false,
+    }
+}
+
+fn cleanup_connection(inspect: () -> bool, close: () -> Result[(), io::Error], operation: Operation) -> Result[
+    Connection,
+    Error,
+] {
+    let bytes = "%1\r\n+proto\r\n:3\r\n".to_bytes();
+    let offset = Ref::new(0);
+    Connection::from_transport(
+        Transport::new(
+            |buffer, _| {
+                let mut count = 0;
+                while count < buffer.len() && offset.get() < bytes.len() {
+                    buffer[count] = bytes[offset.get()];
+                    offset.set(offset.get() + 1);
+                    count += 1;
+                }
+                Result::Ok(count)
+            },
+            |_, _| Result::Ok(()),
+            close,
+            inspect,
+        ),
+        ConnectionOptions::standard(),
+        operation,
+    )
+}
+
+#[test]
+fn connector_unwind_notifies_a_captured_wait_branch_without_timing_assumptions() -> () {
+    let entered: Channel[()] = Channel::new(0);
+    let proceed: Channel[()] = Channel::new(0);
+    let pool = testing::expect_ok(
+        Pool::new(
+            PoolOptions { max_connections: 1, max_idle: 1, ..PoolOptions::standard() },
+            |_| {
+                entered.close();
+                let _ = proceed.recv();
+                panic::raise("connector unwind");
+            },
+        ),
+        "pool",
+    );
+    defer {
+        let _ = pool.close();
+    };
+    task::scope(
+        |scope| {
+            let opening = scope.spawn(|_| panic::catch(|| pool.acquire(Operation::new())));
+            let _ = entered.recv();
+            let waiting = cleanup_wait_signal(pool);
+            testing::assert(!cleanup_was_notified(waiting));
+            proceed.close();
+            testing::assert(opening.join().is_err());
+            testing::assert(cleanup_was_notified(waiting));
+            testing::assert_eq(pool.stats().opening, 0);
+        },
+    );
+}
+
+#[test]
+fn release_and_discard_panics_notify_waiters_without_holding_the_pool_gate() -> () {
+    for mode in 0..3 {
+        let saved: Ref[Option[Pool]] = Ref::new(Option::None);
+        let inspection_panics = Ref::new(false);
+        let close_panics = Ref::new(false);
+        let gate_available = Ref::new(true);
+        let closes = Ref::new(0);
+        let pool = testing::expect_ok(
+            Pool::new(
+                PoolOptions { max_connections: 1, max_idle: 1, ..PoolOptions::standard() },
+                |operation| cleanup_connection(
+                    || {
+                        if inspection_panics.get() {
+                            let pool = testing::expect_some(saved.get(), "pool");
+                            let available = select {
+                                recv(pool.gate) as _ => true,
+                                default => false,
+                            };
+                            if available {
+                                pool.gate.send(());
+                            }
+                            gate_available.set(available);
+                            panic::raise("inspection panic");
+                        }
+                        false
+                    },
+                    || {
+                        closes.set(closes.get() + 1);
+                        if close_panics.get() {
+                            panic::raise("close panic");
+                        }
+                        Result::Ok(())
+                    },
+                    operation,
+                ),
+            ),
+            "pool",
+        );
+        saved.set(Option::Some(pool));
+        defer {
+            let _ = pool.close();
+        };
+        let lease = testing::expect_ok(pool.acquire(Operation::new()), "lease");
+        let waiting = cleanup_wait_signal(pool);
+        inspection_panics.set(mode != 2);
+        close_panics.set(mode != 0);
+        let problem = testing::expect_err(
+            panic::catch(
+                || if mode == 2 {
+                    lease.discard()
+                } else {
+                    lease.release()
+                },
+            ),
+            "unwind",
+        );
+        testing::assert(
+            problem.message().contains(
+                if mode == 0 {
+                    "inspection panic"
+                } else {
+                    "close panic"
+                },
+            ),
+        );
+        testing::assert(gate_available.get());
+        testing::assert(cleanup_was_notified(waiting));
+        testing::assert_eq(closes.get(), 1);
+        testing::assert_eq(pool.stats().leased, 0);
+        testing::assert_eq(pool.stats().idle, 0);
+        testing::assert_ok(lease.release());
+        inspection_panics.set(false);
+        close_panics.set(false);
+        let replacement = testing::expect_ok(pool.acquire(Operation::new()), "replacement");
+        testing::assert_ok(replacement.release());
+        testing::assert_eq(pool.stats().idle, 1);
+    }
+}

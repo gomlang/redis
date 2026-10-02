@@ -73,7 +73,6 @@ fn pool_connector_panic_frees_capacity_and_wakes_waiting_tcp_checkout() -> () {
                 },
             );
             let _ = started.recv();
-            time::sleep(time::Duration::from_milliseconds(20));
             release.send(());
             let caught = first.join();
             testing::assert(caught.is_err());
@@ -149,4 +148,157 @@ fn checkout_health_panics_discard_connection_even_when_close_panics() -> () {
         testing::assert_eq(calls.get(), 2);
         testing::assert_eq(pool.stats().idle, 1);
     }
+}
+
+#[test]
+fn release_callback_panics_close_and_replace_the_lease_without_poisoning_pool() -> () {
+    for close_panics in Vec::from_array([false, true]) {
+        let old = Scripted::new("%1\r\n+proto\r\n:3\r\n");
+        let fresh = Scripted::new("%1\r\n+proto\r\n:3\r\n+PONG\r\n");
+        let calls = Ref::new(0);
+        let pool = testing::expect_ok(
+            Pool::new(
+                pool_options(),
+                |operation| {
+                    calls.set(calls.get() + 1);
+                    let script: Scripted = if calls.get() == 1 {
+                        old
+                    } else {
+                        fresh
+                    };
+                    Connection::from_transport(
+                        script.transport(),
+                        ConnectionOptions::standard(),
+                        operation,
+                    )
+                },
+            ),
+            "release pool",
+        );
+        defer {
+            let _ = pool.close();
+        };
+        let lease = testing::expect_ok(pool.acquire(Operation::new()), "lease");
+        old.panic_closed.set(true);
+        old.panic_close.set(close_panics);
+        let problem = testing::expect_err(panic::catch(|| lease.release()), "release panic");
+        testing::assert(
+            problem.message().contains(
+                if close_panics {
+                    "transport close panic"
+                } else {
+                    "transport is_closed panic"
+                },
+            ),
+        );
+        testing::assert_eq(old.closes.get(), 1);
+        testing::assert_ok(lease.release());
+        testing::assert_eq(
+            testing::expect_ok(pool.execute(pool_ping(), Operation::new()), "pool remains usable"),
+            "PONG",
+        );
+        testing::assert_eq(calls.get(), 2);
+        testing::assert_eq(pool.stats().opening, 0);
+        testing::assert_eq(pool.stats().leased, 0);
+        testing::assert_eq(pool.stats().idle, 1);
+    }
+}
+
+#[test]
+fn release_inspection_panic_closes_tcp_socket_before_replacement() -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(testing::expect_ok(net::SocketAddr::parse("127.0.0.1:0"), "address")),
+        "listener",
+    );
+    defer {
+        let _ = listener.close();
+    };
+    let address = testing::expect_ok(listener.local_addr(), "address");
+    let inspect = Ref::new(false);
+    let observed_close: Channel[()] = Channel::new(1);
+    task::scope(
+        |scope| {
+            let server = scope.spawn(
+                |_| {
+                    for index in 0..2 {
+                        let stream = testing::expect_ok(
+                            listener.accept_with(wait_options()),
+                            "accept",
+                        ).0;
+                        defer {
+                            let _ = stream.close();
+                        };
+                        let peer = Peer {
+                            stream,
+                            decoder: testing::expect_ok(Decoder::new(Limits::standard()), "decoder"),
+                        };
+                        let _ = peer.request();
+                        peer.send("%1\r\n+proto\r\n:3\r\n");
+                        if index == 0 {
+                            let bytes = Vec::from_array([0.to_u8()]);
+                            testing::assert_eq(
+                                testing::expect_ok(
+                                    stream.read_with(bytes.as_mut_slice(), wait_options()),
+                                    "old socket closes",
+                                ),
+                                0,
+                            );
+                            observed_close.send(());
+                        } else {
+                            let _ = peer.request();
+                            peer.send("+PONG\r\n");
+                        }
+                    }
+                },
+            );
+            let pool = testing::expect_ok(
+                Pool::new(
+                    pool_options(),
+                    |operation| Connection::dial(
+                        ConnectionOptions::standard(),
+                        operation,
+                        |remaining| {
+                            let stream = net::TcpStream::connect_with(
+                                address,
+                                remaining.wait_options(),
+                            )?;
+                            Result::Ok(
+                                ecosystem::redis::Transport::new(
+                                    |buffer, options| stream.read_with(
+                                        buffer,
+                                        options.wait_options(),
+                                    ),
+                                    |buffer, options| stream.write_all_with(
+                                        buffer,
+                                        options.wait_options(),
+                                    ),
+                                    || stream.close(),
+                                    || {
+                                        if inspect.get() {
+                                            panic::raise("TCP inspection panic");
+                                        }
+                                        stream.is_closed()
+                                    },
+                                ),
+                            )
+                        },
+                    ),
+                ),
+                "pool",
+            );
+            defer {
+                let _ = pool.close();
+            };
+            let lease = testing::expect_ok(pool.acquire(Operation::new()), "lease");
+            inspect.set(true);
+            testing::assert(panic::catch(|| lease.release()).is_err());
+            let _ = observed_close.recv();
+            inspect.set(false);
+            testing::assert_eq(
+                testing::expect_ok(pool.execute(pool_ping(), Operation::new()), "replacement ping"),
+                "PONG",
+            );
+            server.join();
+        },
+    );
 }
