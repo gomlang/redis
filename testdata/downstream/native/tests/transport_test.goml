@@ -92,3 +92,48 @@ fn published_watch_callback_panic_closes_owned_transport() -> () {
     testing::assert(closed.get());
     testing::assert(connection.is_closed());
 }
+
+#[test]
+fn published_pool_restores_reservation_after_connector_unwind() -> () {
+    let calls = Ref::new(0);
+    let pool = testing::expect_ok(
+        client::Pool::new(
+            client::PoolOptions {
+                max_connections: 1,
+                max_idle: 1,
+                ..client::PoolOptions::standard(),
+            },
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    panic::raise("consumer connector panic");
+                }
+                Result::Err(
+                    client::Error {
+                        kind: client::ErrorKind::Io,
+                        offset: 0,
+                        message: "consumer connector failed",
+                        server: Option::None,
+                        io_kind: Option::None,
+                        index: Option::None,
+                        may_have_executed: false,
+                        partial: Vec::new(),
+                    },
+                )
+            },
+        ),
+        "consumer pool",
+    );
+    defer {
+        let _ = pool.close();
+    };
+    testing::assert(panic::catch(|| pool.acquire(client::Operation::new())).is_err());
+    testing::assert_eq(pool.stats().opening, 0);
+    let problem = testing::expect_err(
+        pool.acquire(client::Operation::new()),
+        "second connector returned error",
+    );
+    testing::assert_eq(problem.message, "consumer connector failed");
+    testing::assert_eq(calls.get(), 2);
+    testing::assert_eq(pool.stats().opening, 0);
+}

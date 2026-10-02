@@ -16,6 +16,7 @@ struct Scripted {
     bad_read: Ref[bool],
     panic_exec: Ref[bool],
     panic_reply: Ref[bool],
+    panic_close: Ref[bool],
 }
 
 impl Scripted {
@@ -28,6 +29,7 @@ impl Scripted {
             bad_read: Ref::new(false),
             panic_exec: Ref::new(false),
             panic_reply: Ref::new(false),
+            panic_close: Ref::new(false),
         }
     }
 
@@ -60,6 +62,9 @@ impl Scripted {
             },
             || {
                 self.closes.set(self.closes.get() + 1);
+                if self.panic_close.get() {
+                    panic::raise("transport close panic");
+                }
                 Result::Ok(())
             },
             || self.closes.get() > 0,

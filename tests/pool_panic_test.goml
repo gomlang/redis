@@ -1,0 +1,152 @@
+package tests;
+
+use ecosystem::redis::{Connection, ConnectionOptions, Pool, PoolOptions, HealthCheck, Operation, Decoder, Limits};
+use std::net;
+use std::panic;
+use std::task;
+use std::testing;
+use std::time;
+
+#[test]
+fn pool_connector_panic_frees_capacity_and_wakes_waiting_tcp_checkout() -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(testing::expect_ok(net::SocketAddr::parse("127.0.0.1:0"), "address")),
+        "listener",
+    );
+    defer {
+        let _ = listener.close();
+    };
+    let address = testing::expect_ok(listener.local_addr(), "address");
+    let entered: Channel[()] = Channel::new(1);
+    let release: Channel[()] = Channel::new(1);
+    let started: Channel[()] = Channel::new(1);
+    let calls = Ref::new(0);
+    let pool = testing::expect_ok(
+        Pool::new(
+            pool_options(),
+            |operation| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    entered.send(());
+                    let _ = release.recv();
+                    panic::raise("connector panic");
+                }
+                Connection::connect(address, ConnectionOptions::standard(), operation)
+            },
+        ),
+        "pool",
+    );
+    defer {
+        let _ = pool.close();
+    };
+    task::scope(
+        |scope| {
+            let server = scope.spawn(
+                |_| {
+                    let stream = testing::expect_ok(
+                        listener.accept_with(wait_options()),
+                        "replacement connection",
+                    ).0;
+                    defer {
+                        let _ = stream.close();
+                    };
+                    let peer = Peer {
+                        stream,
+                        decoder: testing::expect_ok(Decoder::new(Limits::standard()), "decoder"),
+                    };
+                    let _ = peer.request();
+                    peer.send("%1\r\n+proto\r\n:3\r\n");
+                    let _ = peer.request();
+                    peer.send("+PONG\r\n");
+                },
+            );
+            let first = scope.spawn(|_| panic::catch(|| pool.acquire(Operation::new())));
+            let _ = entered.recv();
+            testing::assert_eq(pool.stats().opening, 1);
+            let waiting = scope.spawn(
+                |_| {
+                    started.send(());
+                    pool.execute(
+                        pool_ping(),
+                        Operation::new().with_timeout(time::Duration::from_seconds(2)),
+                    )
+                },
+            );
+            let _ = started.recv();
+            time::sleep(time::Duration::from_milliseconds(20));
+            release.send(());
+            let caught = first.join();
+            testing::assert(caught.is_err());
+            testing::assert_eq(
+                testing::expect_ok(waiting.join(), "waiting checkout survives panic"),
+                "PONG",
+            );
+            server.join();
+        },
+    );
+    testing::assert_eq(calls.get(), 2);
+    testing::assert_eq(pool.stats().opening, 0);
+    testing::assert_eq(pool.stats().leased, 0);
+    testing::assert_eq(pool.stats().idle, 1);
+}
+
+#[test]
+fn checkout_health_panics_discard_connection_even_when_close_panics() -> () {
+    for close_panics in Vec::from_array([false, true]) {
+        let old = Scripted::new("%1\r\n+proto\r\n:3\r\n");
+        let fresh = Scripted::new("%1\r\n+proto\r\n:3\r\n+PONG\r\n");
+        let calls = Ref::new(0);
+        let pool = testing::expect_ok(
+            Pool::new(
+                PoolOptions {
+                    max_connections: 1,
+                    max_idle: 1,
+                    health_check: HealthCheck::OnCheckout,
+                    ..PoolOptions::standard(),
+                },
+                |operation| {
+                    calls.set(calls.get() + 1);
+                    let script: Scripted = if calls.get() == 1 {
+                        old
+                    } else {
+                        fresh
+                    };
+                    Connection::from_transport(
+                        script.transport(),
+                        ConnectionOptions::standard(),
+                        operation,
+                    )
+                },
+            ),
+            "health pool",
+        );
+        defer {
+            let _ = pool.close();
+        };
+        let lease = testing::expect_ok(pool.acquire(Operation::new()), "first lease");
+        testing::assert_ok(lease.release());
+        old.panic_reply.set(true);
+        old.panic_close.set(close_panics);
+        let caught = panic::catch(|| pool.acquire(Operation::new()));
+        let problem = testing::expect_err(caught, "health panic");
+        testing::assert(
+            problem.message().contains(
+                if close_panics {
+                    "transport close panic"
+                } else {
+                    "stateful setup reply panic"
+                },
+            ),
+        );
+        testing::assert_eq(old.closes.get(), 1);
+        testing::assert_eq(pool.stats().opening, 0);
+        testing::assert_eq(pool.stats().leased, 0);
+        testing::assert_eq(pool.stats().idle, 0);
+        testing::assert_eq(
+            testing::expect_ok(pool.execute(pool_ping(), Operation::new()), "fresh connection"),
+            "PONG",
+        );
+        testing::assert_eq(calls.get(), 2);
+        testing::assert_eq(pool.stats().idle, 1);
+    }
+}
