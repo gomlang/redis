@@ -238,6 +238,28 @@ impl Pool {
         entry.connection.close()
     }
 
+    fn recycle(self: Pool, index: isize, entry: PooledConnection) -> bool {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        if self.is_closed() {
+            return false
+        }
+        let mut idle = 0;
+        for slot in self.slots {
+            if let PoolSlot::Idle(_) = slot {
+                idle += 1;
+            }
+        }
+        if idle >= self.options.max_idle {
+            return false
+        }
+        self.slots[index] = PoolSlot::Idle(
+            PooledConnection { returned: time::Instant::now(), ..entry },
+        );
+        self.notify();
+        true
+    }
+
     fn expired(self: Pool, entry: PooledConnection) -> bool {
         self.options.idle_timeout.map(|limit| entry.returned.elapsed().compare(limit) >= 0).unwrap_or(
             false,
@@ -543,26 +565,21 @@ impl Lease {
             return Result::Ok(())
         }
         self.released.set(true);
-        let _ = self.pool.gate.recv();
-        let mut idle = 0;
-        for slot in self.pool.slots {
-            if let PoolSlot::Idle(_) = slot {
-                idle += 1;
+        let transferred = Ref::new(false);
+        defer {
+            if !transferred.get() {
+                let _ = self.pool.discard(self.slot, self.entry);
             }
-        }
-        if !discard && !self.pool.is_closed() && !self.entry.connection.is_closed()
+        };
+        let reusable = !discard && !self.pool.is_closed() && !self.entry.connection.is_closed()
             && !self.pool.options.max_lifetime.map(
                 |limit| self.entry.born.elapsed().compare(limit) >= 0,
-            ).unwrap_or(false)
-            && idle < self.pool.options.max_idle {
-            self.pool.slots[self.slot] = PoolSlot::Idle(
-                PooledConnection { returned: time::Instant::now(), ..self.entry },
-            );
-            self.pool.notify();
-            self.pool.gate.send(());
+            ).unwrap_or(false);
+        if reusable && self.pool.recycle(self.slot, self.entry) {
+            transferred.set(true);
             Result::Ok(())
         } else {
-            self.pool.gate.send(());
+            transferred.set(true);
             self.pool.discard(self.slot, self.entry)
         }
     }

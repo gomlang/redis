@@ -170,6 +170,9 @@ connection attempt frees its reservation and returns its error; it does not spin
 or retry repeatedly. A panicking custom connector also frees its opening slot
 and wakes waiters before the panic propagates. If idle connection validation or
 a checkout health check panics, the connection is closed and its slot is freed.
+Lease release also closes and frees its slot if a custom `is_closed` callback
+panics. Transport callbacks run outside the pool bookkeeping lock; the lease's
+own lock prevents release from overlapping an active lease operation.
 Cleanup releases the slot even if the transport's close callback panics; normal
 panic rules propagate the most recent panic. Connectors own resources until
 they return a `Connection` and must clean up resources they create before
