@@ -234,9 +234,8 @@ impl Pool {
     }
 
     fn discard(self: Pool, index: isize, entry: PooledConnection) -> Result[(), Error] {
-        let result = entry.connection.close();
-        self.empty(index);
-        result
+        defer self.empty(index);
+        entry.connection.close()
     }
 
     fn expired(self: Pool, entry: PooledConnection) -> bool {
@@ -284,15 +283,10 @@ impl Pool {
         Lease,
         Error,
     ] {
-        if let Err(problem) = deadline.check() {
-            let _ = self.discard(index, entry);
-            return Result::Err(problem)
-        }
+        deadline.check()?;
         let _ = self.gate.recv();
         if self.is_closed() {
-            self.slots[index] = PoolSlot::Empty;
             self.gate.send(());
-            let _ = entry.connection.close();
             return Result::Err(pool_closed())
         }
         self.slots[index] = PoolSlot::Leased(entry);
@@ -309,21 +303,33 @@ impl Pool {
             match self.choose(deadline)? {
                 PoolChoice::Wait(changed) => deadline.acquire(changed, self.closed)?,
                 PoolChoice::Create(index) => {
+                    let transferred = Ref::new(false);
+                    let pending: Ref[Option[Connection]] = Ref::new(Option::None);
+                    defer {
+                        if !transferred.get() {
+                            defer self.empty(index);
+                            if let Some(connection) = pending.get() {
+                                let _ = connection.close();
+                            }
+                        }
+                    };
                     let opened = match deadline.remaining() {
                         Ok(remaining) => self.establish(remaining),
                         Err(problem) => Result::Err(problem),
                     };
                     match opened {
                         Ok(connection) => {
+                            pending.set(Option::Some(connection));
                             let now = time::Instant::now();
-                            return self.lease(
+                            let lease = self.lease(
                                 index,
                                 PooledConnection { connection, born: now, returned: now },
                                 deadline,
-                            )
+                            )?;
+                            transferred.set(true);
+                            return Result::Ok(lease)
                         },
                         Err(problem) => {
-                            self.empty(index);
                             return Result::Err(
                                 if self.is_closed() {
                                     pool_closed()
@@ -339,17 +345,19 @@ impl Pool {
                     }
                 },
                 PoolChoice::Inspect(index, entry) => {
+                    let transferred = Ref::new(false);
+                    defer {
+                        if !transferred.get() {
+                            let _ = self.discard(index, entry);
+                        }
+                    };
                     if entry.connection.is_closed() || self.expired(entry) {
-                        let _ = self.discard(index, entry);
                         continue
                     }
                     if self.needs_health(entry) {
                         let operation = match deadline.remaining() {
                             Ok(operation) => operation,
-                            Err(problem) => {
-                                let _ = self.discard(index, entry);
-                                return Result::Err(problem)
-                            },
+                            Err(problem) => return Result::Err(problem),
                         };
                         let timeout = match operation.timeout() {
                             Some(timeout) if timeout.compare(self.options.health_timeout) < 0 => timeout,
@@ -366,12 +374,13 @@ impl Pool {
                             operation.with_timeout(timeout),
                         );
                         if !result.map(|reply| reply == "PONG").unwrap_or(false) {
-                            let _ = self.discard(index, entry);
                             deadline.check()?;
                             continue
                         }
                     }
-                    return self.lease(index, entry, deadline)
+                    let lease = self.lease(index, entry, deadline)?;
+                    transferred.set(true);
+                    return Result::Ok(lease)
                 },
             }
         }

@@ -167,7 +167,14 @@ connectors. Invalid configuration is `ErrorKind::Limit`, exhaustion expires as
 `Timeout`, and cancellation/closure returns `Cancelled`/`Closed`. Acquisition
 errors never set `may_have_executed`, because no caller command was sent. A failed
 connection attempt frees its reservation and returns its error; it does not spin
-or retry repeatedly. Waiters have no fairness guarantee or separate queue bound;
+or retry repeatedly. A panicking custom connector also frees its opening slot
+and wakes waiters before the panic propagates. If idle connection validation or
+a checkout health check panics, the connection is closed and its slot is freed.
+Cleanup releases the slot even if the transport's close callback panics; normal
+panic rules propagate the most recent panic. Connectors own resources until
+they return a `Connection` and must clean up resources they create before
+panicking. These guarantees do not preempt callbacks that block indefinitely.
+Waiters have no fairness guarantee or separate queue bound;
 applications should bound their own concurrent work.
 
 `Lease` provides `execute`, `pipeline`, `transaction` and `compare_and_set`.
