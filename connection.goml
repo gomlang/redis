@@ -316,6 +316,22 @@ impl Connection {
         }
     }
 
+    fn preflight(self: Connection, commands: Vec[Command]) -> Result[(), Error] {
+        if commands.len() > self.options.limits.max_batch {
+            return Result::Err(error(ErrorKind::Limit, 0, "pipeline command limit exceeded"))
+        }
+        let mut length = 0;
+        for command in commands {
+            command.validate_regular()?;
+            let encoded = command.encoded_length(self.options.limits)?;
+            if encoded > self.options.limits.max_frame_bytes - length {
+                return Result::Err(error(ErrorKind::Limit, 0, "batch request byte limit exceeded"))
+            }
+            length += encoded;
+        }
+        Result::Ok(())
+    }
+
     fn wire(self: Connection, commands: Vec[Command], regular: bool) -> Result[Vec[u8], Error] {
         if commands.len() > self.options.limits.max_batch {
             return Result::Err(error(ErrorKind::Limit, 0, "pipeline command limit exceeded"))
@@ -381,7 +397,7 @@ impl Connection {
         let deadline = Deadline::new(operation);
         defer deadline.stop();
         let commands = pipeline.commands.copy();
-        let _ = self.wire(commands, true)?;
+        self.preflight(commands)?;
         deadline.acquire(self.gate, self.closed)?;
         defer self.gate.send(());
         self.ordinary()?;

@@ -2,30 +2,66 @@ package redis;
 
 use std::math;
 
-struct Writer {
+// Validation and byte emission share one traversal. The counter never retains
+// argument bytes while a pipeline waits to acquire its connection.
+
+trait EncodingOutput {
+    fn len(self: Self) -> isize;
+    fn append(self: Self, value: Slice[u8]) -> ();
+}
+
+struct EncodedBytes {
+    bytes: Vec[u8],
+}
+
+impl EncodingOutput for EncodedBytes {
+    fn len(self: EncodedBytes) -> isize {
+        self.bytes.len()
+    }
+
+    fn append(self: EncodedBytes, value: Slice[u8]) -> () {
+        for byte in value {
+            self.bytes.push(byte);
+        }
+    }
+}
+
+struct EncodedLength {
+    length: Ref[isize],
+}
+
+impl EncodingOutput for EncodedLength {
+    fn len(self: EncodedLength) -> isize {
+        self.length.get()
+    }
+
+    fn append(self: EncodedLength, value: Slice[u8]) -> () {
+        self.length.set(self.length.get() + value.len());
+    }
+}
+
+struct Writer[O] {
     limits: Limits,
-    output: Vec[u8],
+    output: O,
     values: Ref[isize],
 }
 
-impl Writer {
-    fn bytes(self: Writer, value: Slice[u8]) -> Result[(), Error] {
+impl[O: EncodingOutput] Writer[O] {
+    fn bytes(self: Writer[O], value: Slice[u8]) -> Result[(), Error] {
         if value.len() > self.limits.max_frame_bytes - self.output.len() {
             return Result::Err(
                 error(ErrorKind::Limit, self.output.len(), "encoded RESP exceeds frame limit"),
             )
         }
-        for byte in value {
-            self.output.push(byte);
-        }
+        self.output.append(value);
         Result::Ok(())
     }
 
-    fn text(self: Writer, value: string) -> Result[(), Error] {
+    fn text(self: Writer[O], value: string) -> Result[(), Error] {
         self.bytes(value.to_bytes().as_slice())
     }
 
-    fn line(self: Writer, tag: string, data: Slice[u8]) -> Result[(), Error] {
+    fn line(self: Writer[O], tag: string, data: Slice[u8]) -> Result[(), Error] {
         if data.len() > self.limits.max_line_bytes {
             return Result::Err(
                 error(ErrorKind::Limit, self.output.len(), "RESP line exceeds limit"),
@@ -47,11 +83,11 @@ impl Writer {
         self.text("\r\n")
     }
 
-    fn header(self: Writer, tag: string, value: string) -> Result[(), Error] {
+    fn header(self: Writer[O], tag: string, value: string) -> Result[(), Error] {
         self.line(tag, value.to_bytes().as_slice())
     }
 
-    fn blob(self: Writer, tag: string, data: Vec[u8]) -> Result[(), Error] {
+    fn blob(self: Writer[O], tag: string, data: Vec[u8]) -> Result[(), Error] {
         if data.len() > self.limits.max_blob_bytes {
             return Result::Err(error(ErrorKind::Limit, self.output.len(), "blob exceeds limit"))
         }
@@ -60,7 +96,10 @@ impl Writer {
         self.text("\r\n")
     }
 
-    fn collection(self: Writer, tag: string, values: Vec[Value], depth: isize) -> Result[(), Error] {
+    fn collection(self: Writer[O], tag: string, values: Vec[Value], depth: isize) -> Result[
+        (),
+        Error,
+    ] {
         if values.len() > self.limits.max_elements {
             return Result::Err(
                 error(ErrorKind::Limit, self.output.len(), "aggregate exceeds element limit"),
@@ -73,7 +112,7 @@ impl Writer {
         Result::Ok(())
     }
 
-    fn mapping(self: Writer, tag: string, fields: Vec[(Value, Value)], depth: isize) -> Result[
+    fn mapping(self: Writer[O], tag: string, fields: Vec[(Value, Value)], depth: isize) -> Result[
         (),
         Error,
     ] {
@@ -90,7 +129,7 @@ impl Writer {
         Result::Ok(())
     }
 
-    fn value(self: Writer, value: Value, depth: isize) -> Result[(), Error] {
+    fn value(self: Writer[O], value: Value, depth: isize) -> Result[(), Error] {
         if depth > self.limits.max_depth || self.values.get() >= self.limits.max_values {
             return Result::Err(
                 error(ErrorKind::Limit, self.output.len(), "RESP nesting or value limit exceeded"),
@@ -186,11 +225,19 @@ impl Writer {
 
 pub fn encode_with_limits(value: Value, limits: Limits) -> Result[Vec[u8], Error] {
     limits.validate()?;
-    let writer = Writer { limits, output: Vec::new(), values: Ref::new(0) };
+    let writer = Writer { limits, output: EncodedBytes { bytes: Vec::new() }, values: Ref::new(0) };
     writer.value(value, 0)?;
-    Result::Ok(writer.output)
+    Result::Ok(writer.output.bytes)
 }
 
 pub fn encode(value: Value) -> Result[Vec[u8], Error] {
     encode_with_limits(value, Limits::standard())
+}
+
+fn encoded_length(value: Value, limits: Limits) -> Result[isize, Error] {
+    limits.validate()?;
+    let output = EncodedLength { length: Ref::new(0) };
+    let writer = Writer { limits, output, values: Ref::new(0) };
+    writer.value(value, 0)?;
+    Result::Ok(output.len())
 }

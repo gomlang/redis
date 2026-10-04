@@ -111,14 +111,22 @@ impl Command {
         Value::Array(result)
     }
 
-    pub fn encode(self: Command, limits: Limits) -> Result[Vec[u8], Error] {
+    fn wire_value(self: Command) -> Value {
         // The encoder only reads these private argument snapshots. Public value()
         // still copies them because callers can mutate its returned buffers.
         let values = Vec::from_array([Value::Bulk(self.name.to_bytes())]);
         for argument in self.arguments {
             values.push(Value::Bulk(argument));
         }
-        encode_with_limits(Value::Array(values), limits)
+        Value::Array(values)
+    }
+
+    pub fn encode(self: Command, limits: Limits) -> Result[Vec[u8], Error] {
+        encode_with_limits(self.wire_value(), limits)
+    }
+
+    fn encoded_length(self: Command, limits: Limits) -> Result[isize, Error] {
+        encoded_length(self.wire_value(), limits)
     }
 
     fn validate_regular(self: Command) -> Result[(), Error] {

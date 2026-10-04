@@ -1,0 +1,349 @@
+package tests;
+
+use ecosystem::redis;
+use ecosystem::redis::commands;
+use std::testing;
+use std::task;
+use std::time;
+
+fn preflight_reference(commands: Vec[redis::Command], limits: redis::Limits) -> Option[redis::Error] {
+    if commands.len() > limits.max_batch {
+        return Option::Some(
+            redis::Error::new(redis::ErrorKind::Limit, "pipeline command limit exceeded"),
+        )
+    }
+    let mut length = 0;
+    for command in commands {
+        let encoded = match command.encode(limits) {
+            Ok(value) => value,
+            Err(problem) => return Option::Some(problem),
+        };
+        if encoded.len() > limits.max_frame_bytes - length {
+            return Option::Some(
+                redis::Error::new(redis::ErrorKind::Limit, "batch request byte limit exceeded"),
+            )
+        }
+        length += encoded.len();
+    }
+    Option::None
+}
+
+fn same_preflight_error(actual: redis::Error, expected: redis::Error) -> () {
+    testing::assert_eq(actual.kind, expected.kind);
+    testing::assert_eq(actual.offset, expected.offset);
+    testing::assert_eq(actual.message, expected.message);
+    testing::assert(!actual.may_have_executed);
+    testing::assert(actual.partial.is_empty());
+}
+
+#[test]
+fn preflight_preserves_encoding_limits_before_expiry_and_sends_nothing() -> () {
+    let set = testing::expect_ok(
+        redis::Command::from_strings(Vec::from_array(["SET", "key", "x".repeat(64)])),
+        "SET",
+    );
+    let ping = testing::expect_ok(commands::ping(), "PING");
+    let commands = Vec::from_array([set, ping.command()]);
+    let plan = redis::Pipeline::new();
+    let _ = plan.queue(redis::raw_request(set));
+    let _ = plan.queue(ping);
+    let limits = Vec::from_array([redis::Limits::standard()]);
+    for maximum in 24..112 {
+        limits.push(redis::Limits { max_frame_bytes: maximum, ..redis::Limits::standard() });
+    }
+    for maximum in 5..66 {
+        limits.push(redis::Limits { max_blob_bytes: maximum, ..redis::Limits::standard() });
+    }
+    for maximum in 3..6 {
+        limits.push(redis::Limits { max_values: maximum, ..redis::Limits::standard() });
+    }
+    for maximum in 2..5 {
+        limits.push(redis::Limits { max_elements: maximum, ..redis::Limits::standard() });
+    }
+    for maximum in 1..4 {
+        limits.push(redis::Limits { max_batch: maximum, ..redis::Limits::standard() });
+    }
+    for limit in limits {
+        let expected = preflight_reference(commands, limit);
+        let script = Scripted::new("%1\r\n+proto\r\n:3\r\n");
+        let connection = testing::expect_ok(
+            redis::Connection::from_transport(
+                script.transport(),
+                redis::ConnectionOptions { limits: limit, ..redis::ConnectionOptions::standard() },
+                redis::Operation::new(),
+            ),
+            "connection",
+        );
+        for kind in 0..3 {
+            let expired = redis::Operation::new().with_timeout(time::Duration::zero());
+            let problem = if kind == 0 {
+                testing::expect_err(connection.pipeline(plan, expired), "pipeline preflight")
+            } else if kind == 1 {
+                testing::expect_err(connection.transaction(plan, expired), "transaction preflight")
+            } else {
+                testing::expect_err(
+                    connection.compare_and_set(
+                        Vec::from_array([redis::Blob::from_string("k")]),
+                        plan,
+                        |_| {
+                            testing::fail("expired callback");
+                            Result::Ok(redis::Pipeline::new())
+                        },
+                        expired,
+                    ),
+                    "WATCH read preflight",
+                )
+            };
+            if let Some(expected) = expected {
+                same_preflight_error(problem, expected);
+            } else {
+                testing::assert_eq(problem.kind, redis::ErrorKind::Timeout);
+                testing::assert(!problem.may_have_executed);
+            }
+            testing::assert_eq(script.writes.len(), 1);
+            testing::assert(!connection.is_closed());
+        }
+        testing::assert_ok(connection.close());
+    }
+}
+
+#[test]
+fn preflight_keeps_command_and_batch_error_order_before_closed_state() -> () {
+    let script = Scripted::new("%1\r\n+proto\r\n:3\r\n");
+    let limits = redis::Limits { max_frame_bytes: 64, max_batch: 2, ..redis::Limits::standard() };
+    let connection = testing::expect_ok(
+        redis::Connection::from_transport(
+            script.transport(),
+            redis::ConnectionOptions { limits, ..redis::ConnectionOptions::standard() },
+            redis::Operation::new(),
+        ),
+        "connection",
+    );
+    testing::assert_ok(connection.close());
+    let big = testing::expect_ok(
+        redis::Command::from_strings(Vec::from_array(["SET", "k", "x".repeat(100)])),
+        "SET",
+    );
+    let forbidden = testing::expect_ok(
+        redis::Command::from_strings(Vec::from_array(["CLIENT", "REPLY", "OFF"])),
+        "CLIENT",
+    );
+    for reverse in[false, true] {
+        let plan = redis::Pipeline::new();
+        let _ = plan.queue(
+            redis::raw_request(
+                if reverse {
+                    forbidden
+                } else {
+                    big
+                },
+            ),
+        );
+        let _ = plan.queue(
+            redis::raw_request(
+                if reverse {
+                    big
+                } else {
+                    forbidden
+                },
+            ),
+        );
+        for transaction in[false, true] {
+            let problem = if transaction {
+                testing::expect_err(
+                    connection.transaction(plan, redis::Operation::new()),
+                    "closed transaction preflight",
+                )
+            } else {
+                testing::expect_err(
+                    connection.pipeline(plan, redis::Operation::new()),
+                    "closed pipeline preflight",
+                )
+            };
+            if reverse {
+                testing::assert_eq(problem.kind, redis::ErrorKind::InvalidCommand);
+                testing::assert_eq(problem.message, "CLIENT REPLY would break reply accounting");
+            } else {
+                same_preflight_error(problem, testing::expect_err(big.encode(limits), "size error"));
+            }
+        }
+        let _ = plan.queue(testing::expect_ok(commands::ping(), "PING"));
+        let problem = testing::expect_err(
+            connection.pipeline(plan, redis::Operation::new()),
+            "batch count first",
+        );
+        testing::assert_eq(problem.message, "pipeline command limit exceeded");
+        testing::assert_eq(script.writes.len(), 1);
+    }
+}
+
+#[test]
+fn watched_preflight_rejects_invalid_plan_before_multi_and_unwatches() -> () {
+    let limits = redis::Limits { max_frame_bytes: 64, ..redis::Limits::standard() };
+    let big = testing::expect_ok(
+        redis::Command::from_strings(Vec::from_array(["SET", "k", "x".repeat(100)])),
+        "SET",
+    );
+    let plan = redis::Pipeline::new();
+    let _ = plan.queue(redis::raw_request(big));
+    let script = Scripted::new("%1\r\n+proto\r\n:3\r\n+OK\r\n+OK\r\n+PONG\r\n");
+    let connection = testing::expect_ok(
+        redis::Connection::from_transport(
+            script.transport(),
+            redis::ConnectionOptions { limits, ..redis::ConnectionOptions::standard() },
+            redis::Operation::new(),
+        ),
+        "connection",
+    );
+    let problem = testing::expect_err(
+        connection.compare_and_set(
+            Vec::from_array([redis::Blob::from_string("key")]),
+            redis::Pipeline::new(),
+            |_| Result::Ok(plan),
+            redis::Operation::new(),
+        ),
+        "invalid built plan",
+    );
+    same_preflight_error(problem, testing::expect_err(big.encode(limits), "size error"));
+    testing::assert_eq(script.writes.len(), 3);
+    testing::assert(script.writes[1] == b"*2\r\n$5\r\nWATCH\r\n$3\r\nkey\r\n");
+    testing::assert(script.writes[2] == b"*1\r\n$7\r\nUNWATCH\r\n");
+    testing::assert(!connection.is_closed());
+    testing::assert_eq(
+        testing::expect_ok(
+            connection.execute(
+                testing::expect_ok(commands::ping(), "PING"),
+                redis::Operation::new(),
+            ),
+            "reuse after preflight",
+        ),
+        "PONG",
+    );
+    testing::assert_ok(connection.close());
+}
+
+#[test]
+fn watch_key_preflight_rejects_before_expiry_without_entering_watch() -> () {
+    let limits = redis::Limits { max_frame_bytes: 64, ..redis::Limits::standard() };
+    let script = Scripted::new("%1\r\n+proto\r\n:3\r\n+PONG\r\n");
+    let connection = testing::expect_ok(
+        redis::Connection::from_transport(
+            script.transport(),
+            redis::ConnectionOptions { limits, ..redis::ConnectionOptions::standard() },
+            redis::Operation::new(),
+        ),
+        "connection",
+    );
+    let key = redis::Blob::from_string("x".repeat(100));
+    let watch = testing::expect_ok(
+        redis::Command::new("WATCH", Vec::from_array([key.bytes])),
+        "WATCH",
+    );
+    let problem = testing::expect_err(
+        connection.compare_and_set(
+            Vec::from_array([key]),
+            redis::Pipeline::new(),
+            |_| {
+                testing::fail("invalid key callback");
+                Result::Ok(redis::Pipeline::new())
+            },
+            redis::Operation::new().with_timeout(time::Duration::zero()),
+        ),
+        "WATCH key preflight",
+    );
+    same_preflight_error(problem, testing::expect_err(watch.encode(limits), "WATCH size error"));
+    testing::assert_eq(script.writes.len(), 1);
+    testing::assert(!connection.is_closed());
+    testing::assert_eq(
+        testing::expect_ok(
+            connection.execute(
+                testing::expect_ok(commands::ping(), "PING"),
+                redis::Operation::new(),
+            ),
+            "reuse after WATCH preflight",
+        ),
+        "PONG",
+    );
+    testing::assert_ok(connection.close());
+}
+
+#[test]
+fn queued_preflight_timeout_keeps_plan_and_connection_reusable() -> () {
+    let entered: Channel[()] = Channel::new(1);
+    let release: Channel[()] = Channel::new(1);
+    let plan = redis::Pipeline::new();
+    let set = plan.queue(
+        testing::expect_ok(
+            commands::set("k", "x".repeat(16384), commands::SetOptions::standard()),
+            "SET",
+        ),
+    );
+    let ping = plan.queue(testing::expect_ok(commands::ping(), "PING"));
+    with_peer(
+        redis::ConnectionOptions::standard(),
+        |peer| {
+            let _ = peer.request();
+            entered.send(());
+            let _ = release.recv();
+            peer.send("+PONG\r\n");
+            let args = peer.request();
+            testing::assert_eq(args[2].bytes.len(), 16384);
+            peer.send("+OK\r\n");
+            let _ = peer.request();
+            peer.send("+PONG\r\n");
+        },
+        |connection| {
+            task::scope(
+                |scope| {
+                    let active = scope.spawn(
+                        |_| connection.execute(
+                            testing::expect_ok(commands::ping(), "active PING"),
+                            redis::Operation::new(),
+                        ),
+                    );
+                    let _ = entered.recv();
+                    for kind in 0..3 {
+                        let operation = redis::Operation::new().with_timeout(
+                            time::Duration::from_milliseconds(10),
+                        );
+                        let problem = if kind == 0 {
+                            testing::expect_err(
+                                connection.pipeline(plan, operation),
+                                "queued pipeline",
+                            )
+                        } else if kind == 1 {
+                            testing::expect_err(
+                                connection.transaction(plan, operation),
+                                "queued transaction",
+                            )
+                        } else {
+                            testing::expect_err(
+                                connection.compare_and_set(
+                                    Vec::from_array([redis::Blob::from_string("k")]),
+                                    plan,
+                                    |_| {
+                                        testing::fail("queued callback");
+                                        Result::Ok(redis::Pipeline::new())
+                                    },
+                                    operation,
+                                ),
+                                "queued WATCH",
+                            )
+                        };
+                        testing::assert_eq(problem.kind, redis::ErrorKind::Timeout);
+                        testing::assert(!problem.may_have_executed);
+                        testing::assert(!connection.is_closed());
+                    }
+                    release.send(());
+                    testing::assert_eq(testing::expect_ok(active.join(), "active result"), "PONG");
+                },
+            );
+            let result = testing::expect_ok(
+                connection.pipeline(plan, redis::Operation::new()),
+                "reuse plan",
+            );
+            testing::assert_ok(result.get(set));
+            testing::assert_eq(testing::expect_ok(result.get(ping), "PING result"), "PONG");
+        },
+    );
+}

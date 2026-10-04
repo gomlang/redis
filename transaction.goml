@@ -6,7 +6,7 @@ impl Connection {
         Error,
     ] {
         let commands = pipeline.commands.copy();
-        let _ = self.wire(commands, true)?;
+        self.preflight(commands)?;
         let completed = Ref::new(false);
         defer {
             if !completed.get() {
@@ -77,7 +77,7 @@ impl Connection {
     ] {
         let deadline = Deadline::new(operation);
         defer deadline.stop();
-        let _ = self.wire(pipeline.commands, true)?;
+        self.preflight(pipeline.commands)?;
         deadline.acquire(self.gate, self.closed)?;
         defer self.gate.send(());
         self.ordinary()?;
@@ -98,13 +98,13 @@ impl Connection {
                 error(ErrorKind::InvalidCommand, 0, "WATCH requires at least one key"),
             )
         }
-        let _ = self.wire(reads.commands, true)?;
+        self.preflight(reads.commands)?;
         let arguments = Vec::new();
         for key in keys {
             arguments.push(key.bytes.copy());
         }
         let watch = single("WATCH", arguments);
-        let _ = watch.encode(self.options.limits)?;
+        let _ = watch.encoded_length(self.options.limits)?;
         deadline.acquire(self.gate, self.closed)?;
         defer self.gate.send(());
         self.ordinary()?;

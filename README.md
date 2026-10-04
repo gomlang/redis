@@ -228,7 +228,9 @@ replies are drained even when some contain server errors. Each ticket checks
 pipeline identity, including independently constructed pipelines; `at` and
 `raw` provide indexed access. A server/type error identifies the response index.
 A pipeline can be reused; its builder and mutable argument/reply buffers must
-not be mutated concurrently with use.
+not be mutated concurrently with use. Preflight validation checks command and
+batch encoding limits without building a wire buffer; queued callers retain
+their plan, and actual encoding begins after acquiring the connection.
 
 `connection.transaction(plan, operation)` holds the connection for MULTI,
 queued commands and EXEC. It verifies MULTI before sending the plan. Queue-time
