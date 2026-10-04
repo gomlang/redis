@@ -1,0 +1,52 @@
+package tests;
+
+use ecosystem::redis;
+use ecosystem::redis::{ErrorKind, Limits, Value};
+use std::testing;
+
+#[test]
+fn constant_resp_headers_respect_the_same_line_limits_as_the_decoder() -> () {
+    let cases = Vec::from_array(
+        [
+            (Value::NullBulk, "$-1\r\n", 2),
+            (Value::NullArray, "*-1\r\n", 2),
+            (Value::Boolean(true), "#t\r\n", 1),
+            (Value::Boolean(false), "#f\r\n", 1),
+            (Value::Null, "_\r\n", 0),
+            (Value::Simple(Vec::new()), "+\r\n", 0),
+            (Value::Array(Vec::from_array([Value::NullBulk])), "*1\r\n$-1\r\n", 2),
+        ],
+    );
+    for (value, wire, required) in cases {
+        for maximum in 0..4 {
+            let limits = Limits { max_line_bytes: maximum, ..Limits::standard() };
+            if maximum < required {
+                testing::assert_eq(
+                    testing::expect_err(
+                        redis::encode_with_limits(value, limits),
+                        "encoded line limit",
+                    ).kind,
+                    ErrorKind::Limit,
+                );
+                testing::assert_eq(
+                    testing::expect_err(
+                        redis::decode_with_limits(wire.to_bytes().as_slice(), limits),
+                        "decoded line limit",
+                    ).kind,
+                    ErrorKind::Limit,
+                );
+            } else {
+                let encoded = testing::expect_ok(
+                    redis::encode_with_limits(value, limits),
+                    "bounded encoding",
+                );
+                testing::assert(encoded == wire.to_bytes());
+                let decoded = testing::expect_ok(
+                    redis::decode_with_limits(encoded.as_slice(), limits),
+                    "same-limit decoder",
+                );
+                testing::assert(testing::expect_ok(redis::encode(decoded), "roundtrip") == encoded);
+            }
+        }
+    }
+}

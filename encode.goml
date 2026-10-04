@@ -102,14 +102,15 @@ impl Writer {
             Value::SimpleError(value) => self.line("-", value.as_slice()),
             Value::Integer(value) => self.header(":", value.to_string()),
             Value::Bulk(value) => self.blob("$", value),
-            Value::NullBulk => self.text("$-1\r\n"),
-            Value::NullArray => self.text("*-1\r\n"),
-            Value::Null => self.text("_\r\n"),
-            Value::Boolean(value) => self.text(
+            Value::NullBulk => self.header("$", "-1"),
+            Value::NullArray => self.header("*", "-1"),
+            Value::Null => self.header("_", ""),
+            Value::Boolean(value) => self.header(
+                "#",
                 if value {
-                    "#t\r\n"
+                    "t"
                 } else {
-                    "#f\r\n"
+                    "f"
                 },
             ),
             Value::Double(value) => self.header(
