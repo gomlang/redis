@@ -1,0 +1,141 @@
+package tests;
+
+use ecosystem::redis;
+use ecosystem::redis::commands;
+use std::task;
+use std::testing;
+
+#[test]
+fn command_encoding_preserves_snapshots_and_returns_independent_bytes() -> () {
+    let key: Vec[u8] = Vec::from_array([0, 255]);
+    let payload: Vec[u8] = Vec::from_array([128, 13, 10, 0]);
+    let arguments = Vec::from_array([key, payload]);
+    let command = testing::expect_ok(redis::Command::new("set", arguments), "command");
+    key[0] = 42;
+    payload[0] = 43;
+    arguments[1] = "replacement".to_bytes();
+    let exposed = command.arguments();
+    exposed[0].bytes[0] = 44;
+    exposed[1].bytes[0] = 45;
+    let redis::Value::Array(values) = command.value() else {
+        testing::fail("command array");
+        return
+    };
+    let redis::Value::Bulk(exposed_payload) = values[2] else {
+        testing::fail("command payload");
+        return
+    };
+    exposed_payload[0] = 46;
+    values[1] = redis::Value::Null;
+    let expected = "*3\r\n$3\r\nSET\r\n$2\r\n".to_bytes();
+    expected.extend(Vec::from_array([0, 255]));
+    expected.extend("\r\n$4\r\n".to_bytes());
+    expected.extend(Vec::from_array([128, 13, 10, 0]));
+    expected.extend(b"\r\n");
+    task::scope(
+        |scope| {
+            for _ in 0..4 {
+                let _ = scope.spawn(
+                    |_| {
+                        for _ in 0..16 {
+                            let encoded = testing::expect_ok(
+                                command.encode(redis::Limits::standard()),
+                                "shared command encoding",
+                            );
+                            testing::assert(encoded == expected);
+                            encoded[0] = 0;
+                            encoded[encoded.len() - 3] = 47;
+                        }
+                    },
+                );
+            }
+        },
+    );
+    testing::assert_eq(command.name(), "SET");
+    testing::assert(command.arguments()[0].bytes == Vec::from_array([0, 255]));
+    testing::assert(command.arguments()[1].bytes == Vec::from_array([128, 13, 10, 0]));
+}
+
+#[test]
+fn command_encoding_keeps_resp_limit_boundaries_and_error_details() -> () {
+    let command = testing::expect_ok(
+        redis::Command::from_strings(Vec::from_array(["SET", "k", "0123456789abcdef"])),
+        "command",
+    );
+    let reference = command.value();
+    let length = testing::expect_ok(redis::encode(reference), "reference wire").len();
+    let limits = Vec::from_array(
+        [
+            redis::Limits { max_buffer_bytes: -1, ..redis::Limits::standard() },
+            redis::Limits { max_frame_bytes: 0, max_depth: 0, ..redis::Limits::standard() },
+        ],
+    );
+    for maximum in 0..length + 2 {
+        limits.push(redis::Limits { max_frame_bytes: maximum, ..redis::Limits::standard() });
+    }
+    for maximum in 0..18 {
+        limits.push(redis::Limits { max_blob_bytes: maximum, ..redis::Limits::standard() });
+    }
+    for maximum in 0..6 {
+        limits.push(redis::Limits { max_values: maximum, ..redis::Limits::standard() });
+        limits.push(redis::Limits { max_elements: maximum, ..redis::Limits::standard() });
+        limits.push(redis::Limits { max_depth: maximum, ..redis::Limits::standard() });
+        limits.push(redis::Limits { max_line_bytes: maximum, ..redis::Limits::standard() });
+    }
+    for limit in limits {
+        match (redis::encode_with_limits(reference, limit), command.encode(limit)) {
+            (Ok(expected), Ok(actual)) => testing::assert(actual == expected),
+            (Err(expected), Err(actual)) => {
+                testing::assert_eq(actual.kind, expected.kind);
+                testing::assert_eq(actual.offset, expected.offset);
+                testing::assert_eq(actual.message, expected.message);
+                testing::assert(!actual.may_have_executed);
+                testing::assert(actual.partial.is_empty());
+            },
+            _ => testing::fail("command encoding and RESP encoding disagree"),
+        }
+    }
+}
+
+#[test]
+fn command_encoding_limit_error_sends_nothing_and_keeps_connection_usable() -> () {
+    let command = testing::expect_ok(
+        redis::Command::from_strings(Vec::from_array(["SET", "k", "0123456789abcdef"])),
+        "command",
+    );
+    let limit = testing::expect_ok(command.encode(redis::Limits::standard()), "wire").len() - 1;
+    let script = Scripted::new("%1\r\n+proto\r\n:3\r\n+PONG\r\n");
+    let connection = testing::expect_ok(
+        redis::Connection::from_transport(
+            script.transport(),
+            redis::ConnectionOptions {
+                limits: redis::Limits { max_frame_bytes: limit, ..redis::Limits::standard() },
+                ..redis::ConnectionOptions::standard(),
+            },
+            redis::Operation::new(),
+        ),
+        "connection",
+    );
+    defer {
+        let _ = connection.close();
+    };
+    let problem = testing::expect_err(
+        connection.execute(redis::raw_request(command), redis::Operation::new()),
+        "request limit",
+    );
+    testing::assert_eq(problem.kind, redis::ErrorKind::Limit);
+    testing::assert(!problem.may_have_executed);
+    testing::assert_eq(script.writes.len(), 1);
+    testing::assert(!connection.is_closed());
+    testing::assert_eq(
+        testing::expect_ok(
+            connection.execute(
+                testing::expect_ok(commands::ping(), "ping"),
+                redis::Operation::new(),
+            ),
+            "reusable connection",
+        ),
+        "PONG",
+    );
+    testing::assert_eq(script.writes.len(), 2);
+}

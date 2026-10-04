@@ -102,6 +102,11 @@ and page; callers iterate until the cursor is zero and handle Redis's documented
 possible duplicates. BLPOP's server-side zero timeout means indefinite waiting;
 the client's default operation timeout still applies.
 
+`Command::new` owns a snapshot of its arguments. `arguments()` and `value()`
+return independent copies; `encode(limits)` reads the private snapshot directly
+and returns independent wire bytes, without copying each argument into an
+intermediate public value.
+
 `Blob` carries arbitrary bytes; `Blob.text()` checks UTF-8. `ToArg` supports
 strings, blobs, byte vectors/slices, booleans and numeric scalars, and applications
 may implement it. `FromReply` supports blobs, UTF-8 strings, checked integer
