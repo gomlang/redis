@@ -271,7 +271,9 @@ bounded queue. `drain_pushes` removes currently queued values; `next_push` waits
 for a queued or newly arriving push. Push limits count both frames and wire
 bytes; overflow during a request closes the connection. `next_push` timeout or
 cancellation preserves an incomplete decoder frame for the next call because
-no request was sent, provided the transport remains open. Standard TLS closes
+no request was sent, provided the transport remains open. This also retains
+bytes returned by a successful read when cancellation arrives before decoding.
+Standard TLS closes
 the stream when active I/O times out or is cancelled; check `is_closed()` and
 establish a new connection in that case. Queued cancellation before TLS I/O
 begins leaves it usable. Reading an unexpected ordinary reply this way is a

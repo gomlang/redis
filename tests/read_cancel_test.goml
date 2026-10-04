@@ -1,0 +1,117 @@
+package tests;
+
+use ecosystem::redis;
+use std::context;
+use std::testing;
+
+fn cancelling_reader(chunks: Vec[string], cancel_at: isize, cancel: () -> ()) -> redis::Transport {
+    let index = Ref::new(0);
+    let closed = Ref::new(false);
+    redis::Transport::new(
+        |buffer, _| {
+            if index.get() == chunks.len() {
+                return Result::Ok(0)
+            }
+            let chunk = chunks[index.get()].to_bytes();
+            testing::assert(chunk.len() <= buffer.len());
+            for offset in 0..chunk.len() {
+                buffer[offset] = chunk[offset];
+            }
+            let interrupted = index.get() == cancel_at;
+            index.set(index.get() + 1);
+            if interrupted {
+                cancel();
+            }
+            Result::Ok(chunk.len())
+        },
+        |_, _| Result::Ok(()),
+        || {
+            closed.set(true);
+            Result::Ok(())
+        },
+        || closed.get(),
+    )
+}
+
+fn assert_push_payload(event: redis::Event, expected: string) -> () {
+    let redis::Event::Message(channel, payload, pattern) = event else {
+        testing::fail("expected message after interrupted read");
+        return
+    };
+    testing::assert_eq(testing::expect_ok(channel.text(), "channel"), "news");
+    testing::assert_eq(testing::expect_ok(payload.text(), "payload"), expected);
+    testing::assert_none(pattern);
+}
+
+fn resume_cancelled_read(subscribed: bool) -> () {
+    let first = ">3\r\n+message\r\n+news\r\n+first\r\n";
+    let second = ">3\r\n+message\r\n+news\r\n+second\r\n";
+    for cut in[1, first.byte_len() - 2, first.byte_len()] {
+        context::with_cancel(
+            context::Context::background(),
+            |ctx, cancel| {
+                let chunks = Vec::from_array(["%1\r\n+proto\r\n:3\r\n"]);
+                if subscribed {
+                    chunks.push(">3\r\n+subscribe\r\n+news\r\n:1\r\n");
+                }
+                let cancel_at = chunks.len();
+                chunks.push(first.byte_slice(0, cut));
+                chunks.push(first.byte_slice(cut, first.byte_len()) + second);
+                let connection = testing::expect_ok(
+                    redis::Connection::from_transport(
+                        cancelling_reader(chunks, cancel_at, || cancel.cancel()),
+                        redis::ConnectionOptions::standard(),
+                        redis::Operation::new(),
+                    ),
+                    "connection",
+                );
+                defer {
+                    let _ = connection.close();
+                };
+                let subscription = if subscribed {
+                    Option::Some(
+                        testing::expect_ok(
+                            connection.subscribe(
+                                Vec::from_array([redis::Blob::from_string("news")]),
+                                redis::SubscriptionKind::Channel,
+                                redis::Operation::new(),
+                            ),
+                            "subscribe",
+                        ),
+                    )
+                } else {
+                    Option::None
+                };
+                let next = |operation| match subscription {
+                    Some(subscription) => subscription.next(operation),
+                    None => connection.next_push(operation).and_then(|value| redis::event(value)),
+                };
+                let problem = testing::expect_err(
+                    next(redis::Operation::new().with_context(ctx)),
+                    "cancel at successful read boundary",
+                );
+                testing::assert_eq(problem.kind, redis::ErrorKind::Cancelled);
+                testing::assert(!problem.may_have_executed);
+                testing::assert(!connection.is_closed());
+                assert_push_payload(
+                    testing::expect_ok(next(redis::Operation::new()), "resume"),
+                    "first",
+                );
+                assert_push_payload(
+                    testing::expect_ok(next(redis::Operation::new()), "next frame"),
+                    "second",
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn next_push_retains_bytes_when_a_successful_read_also_cancels() -> () {
+    resume_cancelled_read(false);
+}
+
+#[test]
+fn subscription_retains_bytes_when_a_successful_read_also_cancels() -> () {
+    resume_cancelled_read(true);
+}

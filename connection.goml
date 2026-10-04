@@ -279,13 +279,15 @@ impl Connection {
                 buffer.as_mut_slice().sub(0, length),
                 deadline.remaining()?,
             )?;
+            // Preserve bytes already consumed even if cancellation wins before
+            // the next decode; read-only push/subscription calls can resume.
+            self.decoder.feed(buffer.slice(0, count))?;
             deadline.check()?;
             if count == 0 {
                 return Result::Err(
                     error(ErrorKind::UnexpectedEof, 0, "Redis server closed the connection"),
                 )
             }
-            self.decoder.feed(buffer.slice(0, count))?;
         }
     }
 
