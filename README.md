@@ -331,8 +331,11 @@ Default limits are 16 MiB per frame, input buffer and blob; 64 KiB per header;
 with 16 MiB queued wire bytes. Root depth is zero. Attribute pairs and their
 payload consume the value/depth budgets. Incremental input buffers can be smaller
 than a frame because consumed payload bytes move into the decoded value. Limits
-bound wire data and counts, not an exact process heap size. Cyclic caller-created
-values terminate at the encoder's depth limit. Decoder/builders are mutable and
+bound wire data and counts, not an exact process heap size. Decoded verbatim
+strings reuse their private payload buffers after removing the format prefix.
+Like bulk strings, their returned byte vectors can retain spare capacity from
+incremental growth while callers hold them. Cyclic caller-created values
+terminate at the encoder's depth limit. Decoder/builders are mutable and
 require external serialization if shared; `Connection` provides its own gate.
 
 The built-in transport follows `std::net`: Linux amd64 numeric IPv4/IPv6 TCP

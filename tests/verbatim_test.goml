@@ -1,0 +1,114 @@
+package tests;
+
+use ecosystem::redis::{Decoder, Limits, Value, ErrorKind};
+use std::testing;
+
+#[test]
+fn verbatim_payloads_remain_independent_after_input_and_decoder_reuse() -> () {
+    let bodies = Vec::from_array(
+        [b"", b"hello", "中😀é".to_bytes(), Vec::from_array([0, 255, 13, 10, 128])],
+    );
+    for format in["txt", "mkd", " !~"] {
+        for expected in bodies {
+            let input = ("=" + (expected.len() + 4).to_string() + "\r\n" + format + ":").to_bytes();
+            input.extend(expected);
+            input.extend(b"\r\n");
+            let length = input.len();
+            input.extend(b":7\r\n");
+            let decoder = testing::expect_ok(Decoder::new(Limits::standard()), "decoder");
+            let frames = Vec::new();
+            for index in 0..input.len() {
+                testing::assert_ok(decoder.feed(input.slice(index, index + 1)));
+                while let Some(frame) = testing::expect_ok(decoder.next_frame(), "fragment") {
+                    frames.push(frame);
+                }
+            }
+            testing::assert_eq(frames.len(), 2);
+            testing::assert_eq(frames[0].wire_bytes, length);
+            testing::assert_eq(frames[1].wire_bytes, 4);
+            let Value::Integer(number) = frames[1].value else {
+                testing::fail("following integer");
+                return
+            };
+            testing::assert_eq(number, 7);
+            let Value::Verbatim(label, saved) = frames[0].value else {
+                testing::fail("verbatim payload");
+                return
+            };
+            testing::assert_eq(label, format);
+            testing::assert(saved == expected);
+            testing::assert_ok(decoder.finish());
+            decoder.reset();
+            input.clear();
+            testing::assert(saved == expected);
+            testing::assert_ok(decoder.feed(b"=8\r\ntxt:next\r\n".as_slice()));
+            let Value::Verbatim(next_label, next) = testing::expect_some(
+                testing::expect_ok(decoder.next(), "next frame"),
+                "next value",
+            ) else {
+                testing::fail("next verbatim");
+                return
+            };
+            testing::assert_eq(next_label, "txt");
+            testing::assert(next == b"next");
+            next[0] = b'X';
+            testing::assert(saved == expected);
+            if !saved.is_empty() {
+                saved[0] = saved[0] ^ 255;
+            }
+            testing::assert(next == b"Xext");
+            testing::assert_eq(label, format);
+            decoder.reset();
+            testing::assert(next == b"Xext");
+        }
+    }
+}
+
+#[test]
+fn verbatim_prefix_errors_preserve_limit_priority_and_reset() -> () {
+    let invalid_label = b"=4\r\nabc:\r\n";
+    invalid_label[4] = 127;
+    let cases = Vec::from_array(
+        [
+            (b"=3\r\ntxt\r\n", Limits::standard(), ErrorKind::Protocol, 4),
+            (b"=4\r\nabc!\r\n", Limits::standard(), ErrorKind::Protocol, 10),
+            (invalid_label, Limits::standard(), ErrorKind::Protocol, 10),
+            (
+                b"=3\r\ntxt\r\n",
+                Limits { max_blob_bytes: 2, ..Limits::standard() },
+                ErrorKind::Limit,
+                4,
+            ),
+            (
+                b"=4\r\nabc!\r\n",
+                Limits { max_frame_bytes: 9, ..Limits::standard() },
+                ErrorKind::Limit,
+                9,
+            ),
+        ],
+    );
+    for (input, limits, kind, offset) in cases {
+        let decoder = testing::expect_ok(Decoder::new(limits), "limited decoder");
+        testing::assert_ok(decoder.feed(input.as_slice()));
+        let problem = testing::expect_err(decoder.next_frame(), "invalid verbatim");
+        testing::assert_eq(problem.kind, kind);
+        testing::assert_eq(problem.offset, offset);
+        let sticky = testing::expect_err(decoder.feed(b"".as_slice()), "poisoned decoder");
+        testing::assert_eq(sticky.kind, kind);
+        testing::assert_eq(sticky.offset, offset);
+        testing::assert_eq(sticky.message, problem.message);
+        decoder.reset();
+        testing::assert_eq(decoder.buffered(), 0);
+        testing::assert(!decoder.is_partial());
+        testing::assert_ok(decoder.feed(b"+OK\r\n".as_slice()));
+        let Value::Simple(data) = testing::expect_some(
+            testing::expect_ok(decoder.next(), "after reset"),
+            "reset value",
+        ) else {
+            testing::fail("simple value after reset");
+            return
+        };
+        testing::assert(data == b"OK");
+        testing::assert_ok(decoder.finish());
+    }
+}
