@@ -211,9 +211,12 @@ impl Decoder {
         if self.cursor.get() > 0
             && (self.cursor.get() >= self.buffer.len() / 2
                 || data.len() > self.limits.max_buffer_bytes - self.buffer.len()) {
-            let rest = self.buffer.slice(self.cursor.get(), self.buffer.len()).to_vec();
-            self.buffer.clear();
-            self.buffer.extend(rest);
+            let remaining = self.buffered();
+            let _ = self.buffer.as_mut_slice().copy_from(
+                0,
+                self.buffer.slice(self.cursor.get(), self.buffer.len()),
+            );
+            self.buffer.truncate(remaining);
             self.cursor.set(0);
         }
         for byte in data {

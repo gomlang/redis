@@ -1,0 +1,66 @@
+package tests;
+
+use ecosystem::redis::{Decoder, Limits, Value};
+use std::testing;
+
+#[test]
+fn bounded_feed_preserves_unread_tail_and_returned_values() -> () {
+    let expected = Vec::from_array([0, 255, 13, 10, 128, 65, 66, 67]);
+    let input = b"+A\r\n$8\r\n".copy();
+    input.extend(expected);
+    input.extend(b"\r\n");
+    let decoder = testing::expect_ok(
+        Decoder::new(Limits { max_buffer_bytes: input.len(), ..Limits::standard() }),
+        "bounded decoder",
+    );
+    testing::assert_ok(decoder.feed(input.as_slice()));
+    let first = testing::expect_some(testing::expect_ok(decoder.next_frame(), "first"), "first");
+    testing::assert_eq(first.wire_bytes, 4);
+    let Value::Simple(saved) = first.value else {
+        testing::fail("first simple value");
+        return
+    };
+    testing::assert(saved == b"A");
+    saved[0] = b'Z';
+    input.clear();
+    testing::assert_eq(decoder.buffered(), 14);
+    testing::assert_eq(decoder.capacity_remaining(), 4);
+
+    // Only four consumed bytes are available, with a longer unread tail behind them.
+    let following = b":7\r\n".copy();
+    testing::assert_ok(decoder.feed(following.as_slice()));
+    following.clear();
+    testing::assert_eq(decoder.buffered(), 18);
+    testing::assert_eq(decoder.capacity_remaining(), 0);
+    let tail = testing::expect_some(testing::expect_ok(decoder.next_frame(), "tail"), "tail");
+    testing::assert_eq(tail.wire_bytes, 14);
+    let Value::Bulk(retained) = tail.value else {
+        testing::fail("unread bulk value");
+        return
+    };
+    testing::assert(retained == expected);
+    let last = testing::expect_some(testing::expect_ok(decoder.next_frame(), "last"), "last");
+    testing::assert_eq(last.wire_bytes, 4);
+    let Value::Integer(number) = last.value else {
+        testing::fail("following integer");
+        return
+    };
+    testing::assert_eq(number, 7);
+    testing::assert_none(testing::expect_ok(decoder.next(), "drained"));
+    testing::assert_ok(decoder.finish());
+    decoder.reset();
+    testing::assert_ok(decoder.feed(b"$1\r\nn\r\n".as_slice()));
+    let Value::Bulk(next) = testing::expect_some(
+        testing::expect_ok(decoder.next(), "reused decoder"),
+        "new value",
+    ) else {
+        testing::fail("new bulk value");
+        return
+    };
+    next[0] = b'X';
+    testing::assert(saved == b"Z");
+    testing::assert(retained == expected);
+    retained[0] = 1;
+    testing::assert(next == b"X");
+    testing::assert_ok(decoder.finish());
+}
