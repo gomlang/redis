@@ -256,10 +256,7 @@ impl Connection {
     }
 
     fn frame(self: Connection, deadline: Deadline) -> Result[Decoded, Error] {
-        let buffer: Vec[u8] = Vec::with_capacity(self.options.read_chunk_bytes);
-        for _ in 0..self.options.read_chunk_bytes {
-            buffer.push(0);
-        }
+        let buffer: Vec[u8] = Vec::new();
         loop {
             self.open()?;
             deadline.check()?;
@@ -269,6 +266,12 @@ impl Connection {
             let available = self.decoder.capacity_remaining();
             if available <= 0 {
                 return Result::Err(error(ErrorKind::Limit, 0, "decoder buffer has no room"))
+            }
+            while buffer.is_empty() {
+                buffer.reserve(self.options.read_chunk_bytes);
+                for _ in 0..self.options.read_chunk_bytes {
+                    buffer.push(0);
+                }
             }
             let length = if available < buffer.len() {
                 available
