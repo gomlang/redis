@@ -345,7 +345,7 @@ on the selected server version; unsupported commands return normal server errors
 ## Validation
 
 ```sh
-(cd ../verification && just ecosystem-test redis)
+(cd ../workflows && just ecosystem-test redis)
 ```
 
 All verification is driven by GoML tests. Library tests cover RESP2/RESP3 codecs,
@@ -355,7 +355,7 @@ The specification generator constructs binary scalars, streamed arrays/maps,
 attributes and blob chunks independently of the codec and compares canonical wire bytes.
 
 Native downstream tests download the official Redis 7.2.5 tag archive with pinned SHA-256,
-build it under `../verification/_artifact/reference`, and run both RESP protocols against
+build it under `../workflows/_artifact/reference`, and run both RESP protocols against
 a fresh authenticated loopback server with persistence disabled. `std::process`
 and scoped cancellation own the server lifetime; startup and subprocess commands
 have deadlines. This requires curl, tar, make, a C compiler and network access on
@@ -376,10 +376,10 @@ and [Redis transactions](https://redis.io/docs/latest/develop/using-commands/tra
 
 ## Development and downstream checks
 
-Requires the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+Requires the source-built GoML toolchain with unversioned registry support pinned in [workflows/ci/toolchain.json](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
 
 ```sh
 goml test
 ```
 
-The independent downstream fixture has its own manifest and is not included in the root `goml test`. Run `(cd ../verification && just ecosystem-test redis)` to build and test that fixture and run the library-specific smoke and compatibility checks.
+The independent downstream fixture has its own manifest and is not included in the root `goml test`. Run `(cd ../workflows && just ecosystem-test redis)` to build and test that fixture and run the library-specific smoke and compatibility checks.
