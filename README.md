@@ -376,11 +376,10 @@ and [Redis transactions](https://redis.io/docs/latest/develop/using-commands/tra
 
 ## Development and downstream checks
 
-Requires GoML 0.1.56 or newer. The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+Requires the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
 
 ```sh
 goml test
-goml verify --timeout 300s
 ```
 
-`goml verify` builds and tests the fixture against an isolated registry snapshot. `(cd ../verification && just ecosystem-test redis)` also runs the library-specific smoke and compatibility checks.
+The independent downstream fixture has its own manifest and is not included in the root `goml test`. Run `(cd ../verification && just ecosystem-test redis)` to build and test that fixture and run the library-specific smoke and compatibility checks.
