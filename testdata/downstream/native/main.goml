@@ -83,6 +83,9 @@ pub fn live(address: string, version: string, password: string) -> () {
     let connection = connect();
     let other = connect();
     let prefix = "goml:" + version + ":";
+    let stream_reader = connect();
+    live_streams(connection, stream_reader, prefix);
+    let _ = stream_reader.close();
     let key = prefix + "string";
     let list = prefix + "list";
     let hash = prefix + "hash";

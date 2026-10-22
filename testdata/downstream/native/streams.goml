@@ -1,0 +1,76 @@
+package main;
+
+use ecosystem::redis::{Connection, Operation, StreamId, Blob, ErrorKind};
+use ecosystem::redis::commands as cmd;
+use std::testing;
+use std::time;
+
+fn live_streams(connection: Connection, blocking: Connection, prefix: string) -> () {
+    let key = prefix + "stream";
+    let _ = run_request(connection, cmd::del(Vec::from_array([key])));
+    let first = StreamId { milliseconds: 1, sequence: 2 };
+    let fields = Vec::from_array(
+        [
+            (Blob::from_string("same"), Blob::new(b"\x00\xff".as_slice())),
+            (Blob::from_string("same"), Blob::from_string("second")),
+        ],
+    );
+    testing::assert_eq(
+        run_request(connection, cmd::xadd(key, cmd::AddId::Exact(first), fields)),
+        first,
+    );
+    let second = run_request(
+        connection,
+        cmd::xadd(key, cmd::AddId::AutoSequence(2), Vec::from_array([("f", "v")])),
+    );
+    testing::assert_eq(second.milliseconds, 2);
+    let range = run_request(
+        connection,
+        cmd::xrange(key, cmd::RangeBound::Minimum, cmd::RangeBound::Maximum, Option::None),
+    );
+    testing::assert_eq(range.len(), 2);
+    testing::assert_eq(range[0].id, first);
+    testing::assert_eq(range[0].fields.len(), 2);
+    testing::assert(range[0].fields[0].1.bytes == b"\x00\xff");
+    testing::assert_eq(text(range[0].fields[1].0), "same");
+    let exclusive = run_request(
+        connection,
+        cmd::xrange(
+            key,
+            cmd::RangeBound::Exclusive(first),
+            cmd::RangeBound::Maximum,
+            Option::Some(1),
+        ),
+    );
+    testing::assert_eq(exclusive.len(), 1);
+    testing::assert_eq(exclusive[0].id, second);
+    let reads = run_request(
+        connection,
+        cmd::xread(
+            Vec::from_array([(key, cmd::ReadId::After(StreamId { milliseconds: 0, sequence: 0 }))]),
+            cmd::ReadOptions::standard(),
+        ),
+    );
+    testing::assert_eq(reads.streams.len(), 1);
+    testing::assert_eq(reads.streams[0].1.len(), 2);
+    let empty = run_request(
+        connection,
+        cmd::xread(
+            Vec::from_array([(key, cmd::ReadId::After(second))]),
+            cmd::ReadOptions::standard(),
+        ),
+    );
+    testing::assert(empty.streams.is_empty());
+    let wait = testing::expect_ok(
+        cmd::xread(
+            Vec::from_array([(key, cmd::ReadId::Latest)]),
+            cmd::ReadOptions { block_milliseconds: Option::Some(0), ..cmd::ReadOptions::standard() },
+        ),
+        "blocking read",
+    );
+    let error = testing::expect_err(
+        blocking.execute(wait, Operation::new().with_timeout(time::Duration::from_milliseconds(50))),
+        "total operation deadline",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Timeout);
+}

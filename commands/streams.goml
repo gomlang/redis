@@ -1,0 +1,119 @@
+package commands;
+
+use ecosystem::redis;
+use ecosystem::redis::{Request, Error, StreamId, StreamEntry, StreamRead, ToArg};
+
+pub enum AddId {
+    Auto,
+    Exact(StreamId),
+    AutoSequence(u64),
+}
+
+pub enum RangeBound {
+    Minimum,
+    Maximum,
+    Inclusive(StreamId),
+    Exclusive(StreamId),
+}
+
+pub enum ReadId {
+    Latest,
+    After(StreamId),
+}
+
+pub struct ReadOptions {
+    pub count: Option[u64],
+    pub block_milliseconds: Option[u64],
+}
+
+impl ReadOptions {
+    pub fn standard() -> ReadOptions {
+        ReadOptions { count: Option::None, block_milliseconds: Option::None }
+    }
+}
+
+fn range_bound(value: RangeBound) -> Vec[u8] {
+    match value {
+        Minimum => b"-",
+        Maximum => b"+",
+        Inclusive(id) => id.to_arg(),
+        Exclusive(id) => ("(" + id.to_string()).to_bytes(),
+    }
+}
+
+pub fn xadd[K: ToArg, F: ToArg, V: ToArg](key: K, id: AddId, fields: Vec[(F, V)]) -> Result[
+    Request[StreamId],
+    Error,
+] {
+    if fields.is_empty() {
+        return Result::Err(invalid("XADD requires fields"))
+    }
+    let id = match id {
+        Auto => b"*",
+        Exact(id) => {
+            if id.milliseconds == 0 && id.sequence == 0 {
+                return Result::Err(invalid("XADD rejects 0-0"))
+            }
+            id.to_arg()
+        },
+        AutoSequence(milliseconds) => (milliseconds.to_string() + "-*").to_bytes(),
+    };
+    let args = Vec::from_array([key.to_arg(), id]);
+    for (field, value) in fields {
+        args.push(field.to_arg());
+        args.push(value.to_arg());
+    }
+    redis::request("XADD", args)
+}
+
+pub fn xrange[K: ToArg](key: K, start: RangeBound, end: RangeBound, count: Option[u64]) -> Result[
+    Request[Vec[StreamEntry]],
+    Error,
+] {
+    let args = Vec::from_array([key.to_arg(), range_bound(start), range_bound(end)]);
+    if let Some(count) = count {
+        if count == 0 || count > 9223372036854775807 {
+            return Result::Err(invalid("COUNT must be positive signed 64-bit"))
+        }
+        args.push(b"COUNT");
+        args.push(count.to_arg());
+    }
+    redis::request("XRANGE", args)
+}
+
+pub fn xread[K: ToArg](streams: Vec[(K, ReadId)], options: ReadOptions) -> Result[
+    Request[StreamRead],
+    Error,
+] {
+    if streams.is_empty() {
+        return Result::Err(invalid("XREAD requires streams"))
+    }
+    let args = Vec::new();
+    if let Some(count) = options.count {
+        if count == 0 || count > 9223372036854775807 {
+            return Result::Err(invalid("COUNT must be positive signed 64-bit"))
+        }
+        args.push(b"COUNT");
+        args.push(count.to_arg());
+    }
+    if let Some(wait) = options.block_milliseconds {
+        if wait > 9223372036854775807 {
+            return Result::Err(invalid("BLOCK exceeds signed 64-bit"))
+        }
+        args.push(b"BLOCK");
+        args.push(wait.to_arg());
+    }
+    args.push(b"STREAMS");
+    for (key, _) in streams {
+        args.push(key.to_arg());
+    }
+    for (_, id) in streams {
+        args.push(
+            match id {
+                Latest => b"$",
+                After(id) => id.to_arg(),
+            },
+        );
+    }
+    redis::request("XREAD", args)
+}

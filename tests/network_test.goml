@@ -593,3 +593,46 @@ fn deadline_covers_whole_pipeline_despite_continued_progress() -> () {
         },
     );
 }
+
+#[test]
+fn malformed_stream_reply_does_not_desynchronize_connection() -> () {
+    with_peer(
+        ConnectionOptions::standard(),
+        |peer| {
+            let request = peer.request();
+            testing::assert(request[0].bytes == b"XRANGE");
+            peer.send("*1\r\n*2\r\n$3\r\n1-0\r\n*1\r\n$3\r\nodd\r\n");
+            let request = peer.request();
+            testing::assert(request[0].bytes == b"PING");
+            peer.send("+PONG\r\n");
+        },
+        |connection| {
+            let request = testing::expect_ok(
+                commands::xrange(
+                    "key",
+                    commands::RangeBound::Minimum,
+                    commands::RangeBound::Maximum,
+                    Option::None,
+                ),
+                "range",
+            );
+            testing::assert_eq(
+                testing::expect_err(
+                    connection.execute(request, Operation::new()),
+                    "typed stream error",
+                ).kind,
+                ErrorKind::Type,
+            );
+            testing::assert_eq(
+                testing::expect_ok(
+                    connection.execute(
+                        testing::expect_ok(commands::ping(), "ping"),
+                        Operation::new(),
+                    ),
+                    "still synchronized",
+                ),
+                "PONG",
+            );
+        },
+    );
+}

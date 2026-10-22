@@ -383,3 +383,18 @@ goml test
 ```
 
 The independent downstream fixture has its own manifest and is not included in the root `goml test`. Run `(cd ../workflows && just ecosystem-test redis)` to build and test that fixture and run the library-specific smoke and compatibility checks.
+
+Streams commands: `commands::xadd`, `xrange`, and `xread` return typed
+`StreamId`, `Vec[StreamEntry]` and `StreamRead`. IDs keep both unsigned 64-bit
+components. Context-specific `AddId`, `RangeBound` and `ReadId` encode `*`,
+`milliseconds-*`, exclusive bounds and `$` without accepting specials in the
+wrong command; XADD rejects 0-0. Range/read COUNT must be positive signed 64-bit.
+Fields remain ordered binary pairs, including duplicates. XREAD accepts RESP2
+arrays and RESP3 maps; nil/timeouts yield an empty streams collection.
+
+`ReadOptions.block_milliseconds = Some(0)` waits indefinitely at the server,
+but the ordinary `Operation` total deadline/cancellation still applies. No
+blocking command retry, automatic ACK, consumer group or replay policy is added.
+Typed reply errors leave protocol framing synchronized. Native consumer live
+tests cover Redis 7.2 RESP2/3 and operation deadlines; synthetic tests also cover
+unsigned maxima, invalid IDs, duplicate binary fields and malformed replies.

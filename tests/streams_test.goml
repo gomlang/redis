@@ -1,0 +1,75 @@
+package tests;
+
+use ecosystem::redis::{StreamId, StreamEntry, StreamRead, FromReply, Value};
+use ecosystem::redis::commands;
+use std::testing;
+
+#[test]
+fn streams_ids_and_typed_reply_forms() -> () {
+    let id = testing::expect_ok(
+        StreamId::parse("18446744073709551615-18446744073709551615"),
+        "max ID",
+    );
+    testing::assert_eq(id.to_string(), "18446744073709551615-18446744073709551615");
+    for text in["", "0", "*", "$", "+1-0", "1--1", "18446744073709551616-0"] {
+        testing::assert(StreamId::parse(text).is_err());
+    }
+    let fields = Value::Array(
+        Vec::from_array(
+            [Value::Bulk(b"f"), Value::Bulk(b"\x00\xff"), Value::Bulk(b"f"), Value::Bulk(b"v")],
+        ),
+    );
+    let entry = Value::Array(Vec::from_array([Value::Bulk(b"1-2"), fields]));
+    let decoded: StreamEntry = testing::expect_ok(FromReply::from_reply(entry), "entry");
+    testing::assert_eq(decoded.fields.len(), 2);
+    testing::assert(decoded.fields[0].1.bytes == b"\x00\xff");
+    let entries = Value::Array(Vec::from_array([entry]));
+    for wire in[
+        Value::Array(
+            Vec::from_array([Value::Array(Vec::from_array([Value::Bulk(b"key"), entries]))]),
+        ),
+        Value::Map(Vec::from_array([(Value::Bulk(b"key"), entries)])),
+    ] {
+        let result: StreamRead = testing::expect_ok(FromReply::from_reply(wire), "RESP2/3 read");
+        testing::assert_eq(result.streams.len(), 1);
+        testing::assert_eq(result.streams[0].1[0].id, StreamId { milliseconds: 1, sequence: 2 });
+    }
+    let bad: Result[StreamEntry, ecosystem::redis::Error] = FromReply::from_reply(
+        Value::Array(
+            Vec::from_array(
+                [Value::Bulk(b"1-2"), Value::Array(Vec::from_array([Value::Bulk(b"odd")]))],
+            ),
+        ),
+    );
+    testing::assert(bad.is_err());
+}
+
+#[test]
+fn stream_command_context_rules() -> () {
+    let zero = StreamId { milliseconds: 0, sequence: 0 };
+    testing::assert(
+        commands::xadd("key", commands::AddId::Exact(zero), Vec::from_array([("f", "v")])).is_err(),
+    );
+    testing::assert(
+        commands::xrange(
+            "key",
+            commands::RangeBound::Minimum,
+            commands::RangeBound::Maximum,
+            Some(0),
+        ).is_err(),
+    );
+    let request = testing::expect_ok(
+        commands::xread(
+            Vec::from_array([("a", commands::ReadId::After(zero)), ("b", commands::ReadId::Latest)]),
+            commands::ReadOptions { count: Some(2), block_milliseconds: Some(0) },
+        ),
+        "read",
+    );
+    let args = request.command().arguments();
+    testing::assert_eq(args.len(), 9);
+    testing::assert(
+        args[4].bytes == b"STREAMS" && args[5].bytes == b"a" && args[6].bytes == b"b"
+            && args[7].bytes == b"0-0"
+            && args[8].bytes == b"$",
+    );
+}

@@ -1,0 +1,95 @@
+package redis;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct StreamId {
+    pub milliseconds: u64,
+    pub sequence: u64,
+}
+
+fn stream_component(value: string) -> Result[u64, Error] {
+    if value == "" {
+        return Result::Err(type_error("stream ID"))
+    }
+    let mut result: u64 = 0;
+    for octet in value.to_bytes() {
+        if octet < b'0' || octet > b'9' {
+            return Result::Err(type_error("stream ID"))
+        }
+        let digit = (octet - b'0').to_u64();
+        if result > (18446744073709551615 - digit) / 10 {
+            return Result::Err(type_error("stream ID overflow"))
+        }
+        result = result * 10 + digit;
+    }
+    Result::Ok(result)
+}
+
+impl StreamId {
+    pub fn parse(value: string) -> Result[StreamId, Error] {
+        let parts = value.split("-");
+        if parts.len() != 2 {
+            return Result::Err(type_error("complete stream ID"))
+        }
+        Result::Ok(
+            StreamId {
+                milliseconds: stream_component(parts[0])?,
+                sequence: stream_component(parts[1])?,
+            },
+        )
+    }
+}
+
+impl ToString for StreamId {
+    fn to_string(self: StreamId) -> string {
+        self.milliseconds.to_string() + "-" + self.sequence.to_string()
+    }
+}
+
+impl ToArg for StreamId {
+    fn to_arg(self: StreamId) -> Vec[u8] {
+        self.to_string().to_bytes()
+    }
+}
+
+impl FromReply for StreamId {
+    fn from_reply(value: Value) -> Result[StreamId, Error] {
+        let text: string = FromReply::from_reply(value)?;
+        StreamId::parse(text)
+    }
+}
+
+pub struct StreamEntry {
+    pub id: StreamId,
+    pub fields: Vec[(Blob, Blob)],
+}
+
+impl FromReply for StreamEntry {
+    fn from_reply(value: Value) -> Result[StreamEntry, Error] {
+        let (id, fields): (StreamId, Entries[Blob, Blob]) = FromReply::from_reply(value)?;
+        Result::Ok(StreamEntry { id, fields: fields.entries })
+    }
+}
+
+pub struct StreamRead {
+    pub streams: Vec[(Blob, Vec[StreamEntry])],
+}
+
+impl FromReply for StreamRead {
+    fn from_reply(value: Value) -> Result[StreamRead, Error] {
+        let value = value.checked()?.without_attributes();
+        if value.is_null() {
+            return Result::Ok(StreamRead { streams: Vec::new() })
+        }
+        let streams: Vec[(Blob, Vec[StreamEntry])] = Vec::new();
+        match value {
+            Value::Map(entries) => for (key, entries) in entries {
+                streams.push((FromReply::from_reply(key)?, FromReply::from_reply(entries)?));
+            },
+            Value::Array(entries) => for entry in entries {
+                streams.push(FromReply::from_reply(entry)?);
+            },
+            _ => return Result::Err(type_error("stream read array or map")),
+        }
+        Result::Ok(StreamRead { streams })
+    }
+}
